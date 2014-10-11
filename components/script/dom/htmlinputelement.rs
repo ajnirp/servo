@@ -19,7 +19,7 @@ use dom::event::Event;
 use dom::eventtarget::{EventTarget, NodeTargetTypeId};
 use dom::htmlelement::HTMLElement;
 use dom::htmlformelement::{FormOwner, HTMLFormElement};
-use dom::node::{DisabledStateHelpers, Node, NodeHelpers, ElementNodeTypeId, document_from_node};
+use dom::node::{DisabledStateHelpers, Node, NodeHelpers, ElementNodeTypeId, document_from_node, window_from_node};
 use dom::virtualmethods::VirtualMethods;
 
 use servo_util::str::{DOMString, parse_unsigned_integer};
@@ -168,6 +168,44 @@ impl<'a> HTMLInputElementMethods for JSRef<'a, HTMLInputElement> {
 
     // https://html.spec.whatwg.org/multipage/forms.html#attr-fe-name
     make_setter!(SetName, "name")
+
+    make_setter!(SetFormAction, "formaction")
+    fn FormAction(self) -> DOMString {
+        let element: JSRef<Element> = ElementCast::from_ref(self);
+        let url = element.get_url_attribute("formaction");
+        match url.as_slice() {
+            "" => {
+                let window = window_from_node(self).root();
+                window.get_url().serialize()
+            },
+            _ => url
+        }
+    }
+
+    make_setter!(SetFormEnctype, "formenctype")
+    fn FormEnctype(self) -> DOMString {
+        let elem: JSRef<Element> = ElementCast::from_ref(self);
+        let enctype = elem.get_string_attribute("formenctype").into_ascii_lower();
+        // https://html.spec.whatwg.org/multipage/forms.html#attr-fs-enctype
+        match enctype.as_slice() {
+            "text/plain" | "multipart/form-data" => enctype,
+            _ => "application/x-www-form-urlencoded".to_string()
+        }
+    }
+
+    make_setter!(SetFormMethod, "formmethod")
+    fn FormMethod(self) -> DOMString {
+        let elem: JSRef<Element> = ElementCast::from_ref(self);
+        let method = elem.get_string_attribute("formmethod").into_ascii_lower();
+        // https://html.spec.whatwg.org/multipage/forms.html#attr-fs-method
+        match method.as_slice() {
+            "post" | "dialog" => method,
+            _ => "get".to_string()
+        }
+    }
+
+    make_setter!(SetFormTarget, "formtarget")
+    make_getter!(FormTarget)
 }
 
 trait HTMLInputElementHelpers {
