@@ -229,7 +229,7 @@ impl ResourceManager {
 
         let loader = match load_data.url.scheme.as_slice() {
             "file" => file_loader::factory,
-            "http" | "https" => http_loader::factory,
+            "http" | "https" | "view-source" => http_loader::factory,
             "data" => data_loader::factory,
             "about" => about_loader::factory,
             _ => {
