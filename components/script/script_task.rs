@@ -690,7 +690,7 @@ impl ScriptTask {
     /// The entry point to document loading. Defines bindings, sets up the window and document
     /// objects, parses HTML and CSS, and kicks off initial layout.
     fn load(&self, pipeline_id: PipelineId, load_data: LoadData) {
-        let mut url = load_data.url.clone();
+        let url = load_data.url.clone();
         debug!("ScriptTask: loading {} on page {}", url, pipeline_id);
 
         let page = self.page.borrow_mut();
@@ -744,66 +744,56 @@ impl ScriptTask {
             });
         }
 
-        let parser_input = if !is_javascript {
-            InputUrl(url.clone())
+        let (parser_input, final_url) = if !is_javascript {
+            // Wait for the LoadResponse so that the parser knows the final URL.
+            let (input_chan, input_port) = channel();
+            self.resource_task.send(Load(NetLoadData {
+                url: url,
+                method: load_data.method,
+                headers: load_data.headers,
+                data: load_data.data,
+                cors: None,
+                consumer: input_chan,
+            }));
+
+            let load_response = input_port.recv();
+
+            load_response.metadata.headers.as_ref().map(|headers| {
+                headers.get().map(|&LastModified(ref tm)| {
+                    document.set_last_modified(dom_last_modified(tm));
+                });
+            });
+
+            let final_url = load_response.metadata.final_url.clone();
+
+            {
+                // Store the final URL before we start parsing, so that DOM routines
+                // (e.g. HTMLImageElement::update_image) can resolve relative URLs
+                // correctly.
+                *page.mut_url() = Some((final_url.clone(), true));
+            }
+
+            (InputUrl(load_response), final_url)
         } else {
             let evalstr = load_data.url.non_relative_scheme_data().unwrap();
             let jsval = window.evaluate_js_with_result(evalstr);
             let strval = FromJSValConvertible::from_jsval(self.get_cx(), jsval, Empty);
-            InputString(strval.unwrap_or("".to_string()))
+            (InputString(strval.unwrap_or("".to_string())), doc_url)
         };
 
-        let (base_url, load_response) = match parser_input {
-            InputUrl(ref url) => {
-                // Wait for the LoadResponse so that the parser knows the final URL.
-                let (input_chan, input_port) = channel();
-                self.resource_task.send(Load(NetLoadData {
-                    url: url.clone(),
-                    method: load_data.method,
-                    headers: load_data.headers,
-                    data: load_data.data,
-                    cors: None,
-                    consumer: input_chan,
-                }));
-
-                let load_response = input_port.recv();
-
-                load_response.metadata.headers.as_ref().map(|headers| {
-                    headers.get().map(|&LastModified(ref tm)| {
-                        document.set_last_modified(dom_last_modified(tm));
-                    });
-                });
-
-                let base_url = load_response.metadata.final_url.clone();
-
-                {
-                    // Store the final URL before we start parsing, so that DOM routines
-                    // (e.g. HTMLImageElement::update_image) can resolve relative URLs
-                    // correctly.
-                    *page.mut_url() = Some((base_url.clone(), true));
-                }
-
-                (base_url, Some(load_response))
-            },
-            InputString(_) => {
-                (doc_url, None)
-            },
-        };
-
-        parse_html(*document, parser_input, base_url, load_response);
-        url = page.get_url().clone();
+        parse_html(*document, parser_input, &final_url);
 
         document.set_ready_state(DocumentReadyStateValues::Interactive);
 
         // Kick off the initial reflow of the page.
-        debug!("kicking off initial reflow of {}", url);
+        debug!("kicking off initial reflow of {}", final_url);
         document.content_changed(NodeCast::from_ref(*document));
         window.flush_layout();
 
         {
             // No more reflow required
             let mut page_url = page.mut_url();
-            *page_url = Some((url.clone(), false));
+            *page_url = Some((final_url.clone(), false));
         }
 
         // https://html.spec.whatwg.org/multipage/#the-end step 4
@@ -823,7 +813,7 @@ impl ScriptTask {
         let wintarget: JSRef<EventTarget> = EventTargetCast::from_ref(*window);
         let _ = wintarget.dispatch_event_with_target(Some(doctarget), *event);
 
-        *page.fragment_name.borrow_mut() = url.fragment;
+        *page.fragment_name.borrow_mut() = final_url.fragment;
 
         let ConstellationChan(ref chan) = self.constellation_chan;
         chan.send(LoadCompleteMsg);
