@@ -11,6 +11,7 @@ use http_loader;
 use sniffer_task;
 use sniffer_task::SnifferTask;
 
+use std::str;
 use std::comm::{channel, Receiver, Sender};
 use hyper::mime::{Mime, Charset};
 use hyper::header::Headers;
@@ -227,9 +228,14 @@ impl ResourceManager {
             eventual_consumer: load_data.consumer.clone(),
         };
 
+        let url_scheme = load_data.url.scheme.clone();
+        if url_scheme.as_slice() == "view-source" {
+            load_data.url.scheme = str::replace(url_scheme.as_slice(), "view-source:", "view-source+");
+        }
+
         let loader = match load_data.url.scheme.as_slice() {
             "file" => file_loader::factory,
-            "http" | "https" | "view-source" => http_loader::factory,
+            "http" | "https" | "view-source+http" | "view-source+https" => http_loader::factory,
             "data" => data_loader::factory,
             "about" => about_loader::factory,
             _ => {

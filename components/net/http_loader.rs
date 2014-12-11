@@ -13,6 +13,8 @@ use hyper::status::Redirection;
 use std::io::Reader;
 use servo_util::task::spawn_named;
 use url::{Url, UrlParser};
+use std::from_str::from_str;
+// use mime::Mime;
 
 pub fn factory(load_data: LoadData, start_chan: Sender<TargetedLoadResponse>) {
     spawn_named("http_loader", proc() load(load_data, start_chan))
@@ -59,7 +61,7 @@ fn load(load_data: LoadData, start_chan: Sender<TargetedLoadResponse>) {
         redirected_to.insert(url.clone());
 
         match url.scheme.as_slice() {
-            "http" | "https" => {}
+            "http" | "https" | "view-source+http" | "view-source+https" => {}
             _ => {
                 let s = format!("{:s} request, but we don't support that scheme", url.scheme);
                 send_error(url, s, senders);
@@ -167,11 +169,18 @@ fn load(load_data: LoadData, start_chan: Sender<TargetedLoadResponse>) {
             }
         }
 
+        let url_scheme = url.scheme.clone();
+
         let mut metadata = Metadata::default(url);
-        metadata.set_content_type(match response.headers.get() {
-            Some(&ContentType(ref mime)) => Some(mime),
-            None => None
-        });
+        if url_scheme.starts_with("view-source+") {
+            let text_plain_type = from_str("text/plain").unwrap();
+            metadata.set_content_type(Some(&text_plain_type));
+        } else {
+            metadata.set_content_type(match response.headers.get() {
+                Some(&ContentType(ref mime)) => Some(mime),
+                None => None
+            });
+        }
         metadata.headers = Some(response.headers.clone());
         metadata.status = Some(response.status_raw().clone());
 
