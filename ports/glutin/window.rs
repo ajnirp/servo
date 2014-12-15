@@ -5,7 +5,7 @@
 //! A windowing implementation using glutin.
 
 use compositing::compositor_task::{mod, CompositorProxy, CompositorReceiver};
-use compositing::windowing::{WindowEvent, WindowMethods};
+use compositing::windowing::{WindowEvent, WindowMethods, KeyEvent};
 use compositing::windowing::{IdleWindowEvent, ResizeWindowEvent};
 use compositing::windowing::{MouseWindowEventClass,  MouseWindowMoveEventClass, ScrollWindowEvent};
 use compositing::windowing::{ZoomWindowEvent, PinchZoomWindowEvent, NavigationWindowEvent};
@@ -15,11 +15,13 @@ use compositing::windowing::{Forward, Back};
 use geom::point::{Point2D, TypedPoint2D};
 use geom::scale_factor::ScaleFactor;
 use geom::size::TypedSize2D;
-use gleam::gl;
 use layers::geometry::DevicePixel;
 use layers::platform::surface::NativeGraphicsMetadata;
+use msg::constellation_msg;
+use msg::constellation_msg::{Key, KeyEscape, KeyEqual, KeyMinus, KeyBackspace, KeyPageUp, KeyPageDown, CONTROL, SHIFT, ALT};
 use msg::compositor_msg::{IdlePaintState, PaintState, PaintingPaintState};
 use msg::compositor_msg::{FinishedLoading, Blank, Loading, PerformingLayout, ReadyState};
+use msg::constellation_msg::LoadData;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use time::{mod, Timespec};
@@ -28,14 +30,14 @@ use util::opts::{RenderApi, Mesa, OpenGL};
 use glutin;
 use NestedEventLoopListener;
 
+#[cfg(not(target_os="android"))]
+use gleam::gl;
+
 #[cfg(target_os="linux")]
 use std::ptr;
 
 struct HeadlessContext {
-    // Although currently unused, this context needs to be stored.
-    // Otherwise, its drop() is called, deleting the mesa context
-    // before it can be used.
-    _context: glutin::HeadlessContext,
+    context: glutin::HeadlessContext,
     size: TypedSize2D<DevicePixel, uint>,
 }
 
@@ -72,6 +74,28 @@ pub struct Window {
     last_title_set_time: Cell<Timespec>,
 }
 
+#[cfg(not(target_os="android"))]
+fn load_gl_functions(glutin: &WindowHandle) {
+    match glutin {
+        &Windowed(ref window) => gl::load_with(|s| window.get_proc_address(s)),
+        &Headless(ref headless) => gl::load_with(|s| headless.context.get_proc_address(s)),
+    }
+}
+
+#[cfg(target_os="android")]
+fn load_gl_functions(_glutin: &WindowHandle) {
+}
+
+#[cfg(not(target_os="android"))]
+fn gl_version() -> (uint, uint) {
+    (3, 0)
+}
+
+#[cfg(target_os="android")]
+fn gl_version() -> (uint, uint) {
+    (2, 0)
+}
+
 impl Window {
     /// Creates a new window.
     pub fn new(is_foreground: bool, size: TypedSize2D<DevicePixel, uint>, render_api: RenderApi)
@@ -85,13 +109,11 @@ impl Window {
                 let glutin_window = glutin::WindowBuilder::new()
                                     .with_title("Servo [glutin]".to_string())
                                     .with_dimensions(window_size.width, window_size.height)
-                                    .with_gl_version((3, 0))
+                                    .with_gl_version(gl_version())
                                     .with_visibility(is_foreground)
                                     .build()
                                     .unwrap();
                 unsafe { glutin_window.make_current() };
-
-                gl::load_with(|s| glutin_window.get_proc_address(s));
 
                 Windowed(glutin_window)
             }
@@ -101,14 +123,14 @@ impl Window {
                 let headless_context = headless_builder.build().unwrap();
                 unsafe { headless_context.make_current() };
 
-                gl::load_with(|s| headless_context.get_proc_address(s));
-
                 Headless(HeadlessContext {
-                    _context: headless_context,
+                    context: headless_context,
                     size: size,
                 })
             }
         };
+
+        load_gl_functions(&glutin);
 
         let window = Window {
             glutin: glutin,
@@ -184,6 +206,22 @@ impl WindowMethods for Window {
         ScaleFactor(1.0)
     }
 
+    fn set_page_title(&self, _: Option<String>) {
+        // TODO(gw)
+    }
+
+    fn set_page_load_data(&self, _: LoadData) {
+        // TODO(gw)
+    }
+
+    fn load_end(&self) {
+        // TODO(gw)
+    }
+
+    fn prepare_for_composite(&self) -> bool {
+        true
+    }
+
     #[cfg(target_os="linux")]
     fn native_metadata(&self) -> NativeGraphicsMetadata {
         match self.glutin {
@@ -207,6 +245,41 @@ impl WindowMethods for Window {
             NativeGraphicsMetadata {
                 pixel_format: CGLGetPixelFormat(CGLGetCurrentContext()),
             }
+        }
+    }
+
+    #[cfg(target_os="android")]
+    fn native_metadata(&self) -> NativeGraphicsMetadata {
+        use egl::egl::GetCurrentDisplay;
+        NativeGraphicsMetadata {
+            display: GetCurrentDisplay(),
+        }
+    }
+
+    /// Helper function to handle keyboard events.
+    fn handle_key(&self, key: Key, mods: constellation_msg::KeyModifiers) {
+        match key {
+            // TODO(negge): handle window close event
+            KeyEscape => {},
+            KeyEqual if mods.contains(CONTROL) => { // Ctrl-+
+                self.event_queue.borrow_mut().push(ZoomWindowEvent(1.1));
+            }
+            KeyMinus if mods.contains(CONTROL) => { // Ctrl--
+                self.event_queue.borrow_mut().push(ZoomWindowEvent(1.0/1.1));
+            }
+            KeyBackspace if mods.contains(SHIFT) => { // Shift-Backspace
+                self.event_queue.borrow_mut().push(NavigationWindowEvent(Forward));
+            }
+            KeyBackspace => { // Backspace
+                self.event_queue.borrow_mut().push(NavigationWindowEvent(Back));
+            }
+            KeyPageDown => {
+                self.scroll_window(0.0, -self.framebuffer_size().as_f32().to_untyped().height);
+            }
+            KeyPageUp => {
+                self.scroll_window(0.0, self.framebuffer_size().as_f32().to_untyped().height);
+            }
+            _ => {}
         }
     }
 }
@@ -249,6 +322,33 @@ impl Window {
     }
 }
 
+fn glutin_mods_to_script_mods(modifiers: KeyModifiers) -> constellation_msg::KeyModifiers {
+    let mut result = constellation_msg::KeyModifiers::from_bits(0).unwrap();
+    if modifiers.intersects(LEFT_SHIFT | RIGHT_SHIFT) {
+        result.insert(SHIFT);
+    }
+    if modifiers.intersects(LEFT_CONTROL | RIGHT_CONTROL) {
+        result.insert(CONTROL);
+    }
+    if modifiers.intersects(LEFT_ALT | RIGHT_ALT) {
+        result.insert(ALT);
+    }
+    result
+}
+
+fn glutin_key_to_script_key(key: glutin::VirtualKeyCode) -> Result<constellation_msg::Key, ()> {
+    // TODO(negge): add more key mappings
+    match key {
+        glutin::Escape => Ok(KeyEscape),
+        glutin::Equals => Ok(KeyEqual),
+        glutin::Minus => Ok(KeyMinus),
+        glutin::Back => Ok(KeyBackspace),
+        glutin::PageDown => Ok(KeyPageDown),
+        glutin::PageUp => Ok(KeyPageUp),
+        _ => Err(()),
+    }
+}
+
 impl Window {
     fn handle_window_event(&self, event: glutin::Event) -> bool {
         match event {
@@ -263,7 +363,16 @@ impl Window {
                         (_, glutin::RShift) => self.toggle_modifier(RIGHT_SHIFT),
                         (_, glutin::LAlt) => self.toggle_modifier(LEFT_ALT),
                         (_, glutin::RAlt) => self.toggle_modifier(RIGHT_ALT),
-                        (glutin::Pressed, key_code) => return self.handle_key(key_code),
+                        (glutin::Pressed, key_code) => {
+                            match glutin_key_to_script_key(key_code) {
+                                Ok(key) => {
+                                    let state = constellation_msg::Pressed;
+                                    let modifiers = glutin_mods_to_script_mods(self.key_modifiers.get());
+                                    self.event_queue.borrow_mut().push(KeyEvent(key, state, modifiers));
+                                }
+                                _ => {}
+                            }
+                        }
                         (_, _) => {}
                     }
                 }
@@ -327,34 +436,6 @@ impl Window {
         self.event_queue.borrow_mut().push(event);
     }
 
-    /// Helper function to handle keyboard events.
-    fn handle_key(&self, key: glutin::VirtualKeyCode) -> bool {
-        match key {
-            glutin::Escape => return true,
-            glutin::Equals if self.ctrl_pressed() => { // Ctrl-+
-                self.event_queue.borrow_mut().push(ZoomWindowEvent(1.1));
-            }
-            glutin::Minus if self.ctrl_pressed() => { // Ctrl--
-                self.event_queue.borrow_mut().push(ZoomWindowEvent(1.0/1.1));
-            }
-            glutin::Back if self.shift_pressed() => { // Shift-Backspace
-                self.event_queue.borrow_mut().push(NavigationWindowEvent(Forward));
-            }
-            glutin::Back => { // Backspace
-                self.event_queue.borrow_mut().push(NavigationWindowEvent(Back));
-            }
-            glutin::PageDown => {
-                self.scroll_window(0.0, -self.framebuffer_size().as_f32().to_untyped().height);
-            }
-            glutin::PageUp => {
-                self.scroll_window(0.0, self.framebuffer_size().as_f32().to_untyped().height);
-            }
-            _ => {}
-        }
-
-        false
-    }
-
     /// Helper function to handle a click
     fn handle_mouse(&self, button: glutin::MouseButton, action: glutin::ElementState, x: int, y: int) {
         // FIXME(tkuehn): max pixel dist should be based on pixel density
@@ -416,7 +497,7 @@ impl Window {
         match self.glutin {
             Windowed(ref window) => {
                 let mut close_event = false;
-                for event in window.poll_events() {
+                for event in window.wait_events() {
                     close_event = self.handle_window_event(event);
                     if close_event {
                         break;
@@ -452,4 +533,49 @@ impl CompositorProxy for GlutinCompositorProxy {
             sender: self.sender.clone(),
         } as Box<CompositorProxy+Send>
     }
+}
+
+// These functions aren't actually called. They are here as a link
+// hack because Skia references them.
+
+#[allow(non_snake_case)]
+#[no_mangle]
+pub extern "C" fn glBindVertexArrayOES(_array: uint)
+{
+    unimplemented!()
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+pub extern "C" fn glDeleteVertexArraysOES(_n: int, _arrays: *const ())
+{
+    unimplemented!()
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+pub extern "C" fn glGenVertexArraysOES(_n: int, _arrays: *const ())
+{
+    unimplemented!()
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+pub extern "C" fn glRenderbufferStorageMultisampleIMG(_: int, _: int, _: int, _: int, _: int)
+{
+    unimplemented!()
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+pub extern "C" fn glFramebufferTexture2DMultisampleIMG(_: int, _: int, _: int, _: int, _: int, _: int)
+{
+    unimplemented!()
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+pub extern "C" fn glDiscardFramebufferEXT(_: int, _: int, _: *const ())
+{
+    unimplemented!()
 }

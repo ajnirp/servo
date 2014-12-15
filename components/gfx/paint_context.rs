@@ -598,10 +598,22 @@ impl<'a> PaintContext<'a>  {
                 border_style::ridge  =>  false,
                 _                    =>  panic!("invalid border style")
         };
-        let darker_color               = self.scale_color(color, if is_groove { 1.0/3.0 } else { 2.0/3.0 });
+
+        let mut lighter_color;
+        let mut darker_color;
+
+        if color.r != 0.0 || color.g != 0.0 || color.b != 0.0 {
+            darker_color = self.scale_color(color, if is_groove { 1.0/3.0 } else { 2.0/3.0 });
+            lighter_color = color;
+        } else {
+            // You can't scale black color (i.e. 'scaled = 0 * scale', equals black).
+            darker_color = Color::new(0.3, 0.3, 0.3, color.a);
+            lighter_color = Color::new(0.7, 0.7, 0.7, color.a);
+        }
+
         let (outer_color, inner_color) = match (direction, is_groove) {
-            (Top, true)  | (Left, true)  | (Right, false) | (Bottom, false) => (darker_color, color),
-            (Top, false) | (Left, false) | (Right, true)  | (Bottom, true)  => (color, darker_color)
+            (Top, true)  | (Left, true)  | (Right, false) | (Bottom, false) => (darker_color, lighter_color),
+            (Top, false) | (Left, false) | (Right, true)  | (Bottom, true)  => (lighter_color, darker_color)
         };
         // outer portion of the border
         self.draw_border_path(&original_bounds, direction, scaled_border, radius, outer_color);
@@ -843,8 +855,8 @@ impl ScaledFontExtensionMethods for ScaledFont {
         let mut azglyphs = vec!();
         azglyphs.reserve(range.length().to_uint());
 
-        for (glyphs, _offset, slice_range) in run.iter_slices_for_range(range) {
-            for (_i, glyph) in glyphs.iter_glyphs_for_char_range(&slice_range) {
+        for slice in run.natural_word_slices_in_range(range) {
+            for (_i, glyph) in slice.glyphs.iter_glyphs_for_char_range(&slice.range) {
                 let glyph_advance = glyph.advance();
                 let glyph_offset = glyph.offset().unwrap_or(Zero::zero());
                 let azglyph = struct__AzGlyph {

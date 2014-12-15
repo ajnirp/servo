@@ -355,6 +355,38 @@ pub mod longhands {
         </%self:longhand>
     % endfor
 
+    ${new_style_struct("Outline", is_inherited=False)}
+
+    // TODO(pcwalton): `invert`
+    ${predefined_type("outline-color", "CSSColor", "CurrentColor")}
+
+    <%self:single_component_value name="outline-style">
+        pub use super::border_top_style::{get_initial_value, to_computed_value};
+        pub type SpecifiedValue = super::border_top_style::SpecifiedValue;
+        pub mod computed_value {
+            pub type T = super::super::border_top_style::computed_value::T;
+        }
+        pub fn from_component_value(value: &ComponentValue, base_url: &Url)
+                                    -> Result<SpecifiedValue,()> {
+            match value {
+                &Ident(ref ident) if ident.eq_ignore_ascii_case("hidden") => {
+                    // `hidden` is not a valid value.
+                    Err(())
+                }
+                _ => super::border_top_style::from_component_value(value, base_url)
+            }
+        }
+    </%self:single_component_value>
+
+    <%self:longhand name="outline-width">
+        pub use super::border_top_width::{get_initial_value, parse};
+        pub use computed::compute_Au as to_computed_value;
+        pub type SpecifiedValue = super::border_top_width::SpecifiedValue;
+        pub mod computed_value {
+            pub type T = super::super::border_top_width::computed_value::T;
+        }
+    </%self:longhand>
+
     ${new_style_struct("PositionOffsets", is_inherited=False)}
 
     % for side in ["top", "right", "bottom", "left"]:
@@ -1056,6 +1088,58 @@ pub mod longhands {
     // TODO: initial value should be 'start' (CSS Text Level 3, direction-dependent.)
     ${single_keyword("text-align", "left right center justify")}
 
+    <%self:single_component_value name="letter-spacing">
+        pub type SpecifiedValue = Option<specified::Length>;
+        pub mod computed_value {
+            use super::super::Au;
+            pub type T = Option<Au>;
+        }
+        #[inline]
+        pub fn get_initial_value() -> computed_value::T {
+            None
+        }
+        #[inline]
+        pub fn to_computed_value(value: SpecifiedValue, context: &computed::Context)
+                                 -> computed_value::T {
+            value.map(|length| computed::compute_Au(length, context))
+        }
+        pub fn from_component_value(input: &ComponentValue, _: &Url) -> Result<SpecifiedValue,()> {
+            match input {
+                &Ident(ref value) if value.eq_ignore_ascii_case("normal") => Ok(None),
+                _ => specified::Length::parse_non_negative(input).map(|length| Some(length)),
+            }
+        }
+    </%self:single_component_value>
+
+    <%self:single_component_value name="word-spacing">
+        pub type SpecifiedValue = Option<specified::Length>;
+        pub mod computed_value {
+            use super::super::Au;
+            pub type T = Option<Au>;
+        }
+        #[inline]
+        pub fn get_initial_value() -> computed_value::T {
+            None
+        }
+        #[inline]
+        pub fn to_computed_value(value: SpecifiedValue, context: &computed::Context)
+                                 -> computed_value::T {
+            value.map(|length| computed::compute_Au(length, context))
+        }
+        pub fn from_component_value(input: &ComponentValue, _: &Url) -> Result<SpecifiedValue,()> {
+            match input {
+                &Ident(ref value) if value.eq_ignore_ascii_case("normal") => Ok(None),
+                _ => specified::Length::parse_non_negative(input).map(|length| Some(length)),
+            }
+        }
+    </%self:single_component_value>
+
+    ${predefined_type("text-indent", "LengthOrPercentage", "computed::LP_Length(Au(0))")}
+
+    // Also known as "word-wrap" (which is more popular because of IE), but this is the preferred
+    // name per CSS-TEXT 6.2.
+    ${single_keyword("overflow-wrap", "normal break-word")}
+
     ${new_style_struct("Text", is_inherited=False)}
 
     <%self:longhand name="text-decoration">
@@ -1184,6 +1268,9 @@ pub mod longhands {
     </%self:longhand>
 
     ${single_keyword("white-space", "normal pre nowrap")}
+
+    // TODO(pcwalton): `full-width`
+    ${single_keyword("text-transform", "none capitalize uppercase lowercase")}
 
     // CSS 2.1, Section 17 - Tables
     ${new_style_struct("Table", is_inherited=False)}
@@ -1541,6 +1628,52 @@ pub mod shorthands {
         })
     </%self:shorthand>
 
+    <%self:shorthand name="outline" sub_properties="outline-color outline-style outline-width">
+        let (mut color, mut style, mut width, mut any) = (None, None, None, false);
+        for component_value in input.skip_whitespace() {
+            if color.is_none() {
+                match specified::CSSColor::parse(component_value) {
+                    Ok(c) => {
+                        color = Some(c);
+                        any = true;
+                        continue
+                    }
+                    Err(()) => {}
+                }
+            }
+            if style.is_none() {
+                match border_top_style::from_component_value(component_value, base_url) {
+                    Ok(s) => {
+                        style = Some(s);
+                        any = true;
+                        continue
+                    }
+                    Err(()) => {}
+                }
+            }
+            if width.is_none() {
+                match parse_border_width(component_value, base_url) {
+                    Ok(w) => {
+                        width = Some(w);
+                        any = true;
+                        continue
+                    }
+                    Err(()) => {}
+                }
+            }
+            return Err(())
+        }
+        if any {
+            Ok(Longhands {
+                outline_color: color,
+                outline_style: style,
+                outline_width: width,
+            })
+        } else {
+            Err(())
+        }
+    </%self:shorthand>
+
     <%self:shorthand name="font" sub_properties="font-style font-variant font-weight
                                                  font-size line-height font-family">
         let mut iter = input.skip_whitespace();
@@ -1618,6 +1751,15 @@ pub mod shorthands {
         })
     </%self:shorthand>
 
+    // Per CSS-TEXT 6.2, "for legacy reasons, UAs must treat `word-wrap` as an alternate name for
+    // the `overflow-wrap` property, as if it were a shorthand of `overflow-wrap`."
+    <%self:shorthand name="word-wrap" sub_properties="overflow-wrap">
+        overflow_wrap::parse(input, base_url).map(|specified_value| {
+            Longhands {
+                overflow_wrap: Some(specified_value),
+            }
+        })
+    </%self:shorthand>
 }
 
 
@@ -1875,6 +2017,7 @@ pub struct ComputedValues {
     % endfor
     shareable: bool,
     pub writing_mode: WritingMode,
+    pub root_font_size: Au,
 }
 
 impl ComputedValues {
@@ -2034,7 +2177,8 @@ lazy_static! {
             }),
         % endfor
         shareable: true,
-        writing_mode: WritingMode::empty()
+        writing_mode: WritingMode::empty(),
+        root_font_size: longhands::font_size::get_initial_value(),
     };
 }
 
@@ -2132,6 +2276,7 @@ fn cascade_with_cached_declarations(applicable_declarations: &[DeclarationBlock]
             ${style_struct.ident}: style_${style_struct.ident},
         % endfor
         shareable: shareable,
+        root_font_size: parent_style.root_font_size,
     }
 }
 
@@ -2173,6 +2318,7 @@ pub fn cascade(applicable_declarations: &[DeclarationBlock],
                 inherited_style.get_inheritedtext()._servo_text_decorations_in_effect,
             // To be overridden by applicable declarations:
             font_size: inherited_font_style.font_size,
+            root_font_size: inherited_style.root_font_size,
             display: longhands::display::get_initial_value(),
             color: inherited_style.get_color().color,
             text_decoration: longhands::text_decoration::get_initial_value(),
@@ -2205,7 +2351,7 @@ pub fn cascade(applicable_declarations: &[DeclarationBlock],
                 FontSizeDeclaration(ref value) => {
                     context.font_size = match *value {
                         SpecifiedValue(specified_value) => computed::compute_Au_with_font_size(
-                            specified_value, context.inherited_font_size),
+                            specified_value, context.inherited_font_size, context.root_font_size),
                         Initial => longhands::font_size::get_initial_value(),
                         Inherit => context.inherited_font_size,
                     }
@@ -2343,12 +2489,17 @@ pub fn cascade(applicable_declarations: &[DeclarationBlock],
         box_.display = longhands::display::to_computed_value(box_.display, &context);
     }
 
+    if is_root_element {
+        context.root_font_size = context.font_size;
+    }
+
     (ComputedValues {
         writing_mode: get_writing_mode(&*style_inheritedbox),
         % for style_struct in STYLE_STRUCTS:
             ${style_struct.ident}: style_${style_struct.ident},
         % endfor
         shareable: shareable,
+        root_font_size: context.root_font_size,
     }, cacheable)
 }
 
@@ -2371,6 +2522,7 @@ pub fn cascade_anonymous(parent_style: &ComputedValues) -> ComputedValues {
         % endfor
         shareable: false,
         writing_mode: parent_style.writing_mode,
+        root_font_size: parent_style.root_font_size,
     };
     {
         let border = result.border.make_unique();

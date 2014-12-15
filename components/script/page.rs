@@ -21,7 +21,6 @@ use script_traits::{UntrustedNodeAddress, ScriptControlChan};
 
 use geom::{Point2D, Rect, Size2D};
 use js::rust::Cx;
-use servo_msg::compositor_msg::PerformingLayout;
 use servo_msg::compositor_msg::ScriptListener;
 use servo_msg::constellation_msg::{ConstellationChan, WindowSizeData};
 use servo_msg::constellation_msg::{PipelineId, SubpageId};
@@ -228,26 +227,18 @@ impl Page {
             self.children
                 .borrow_mut()
                 .iter_mut()
-                .enumerate()
-                .find(|&(_idx, ref page_tree)| {
-                    // FIXME: page_tree has a lifetime such that it's unusable for anything.
-                    let page_tree_id = page_tree.id;
-                    page_tree_id == id
-                })
-                .map(|(idx, _)| idx)
+                .position(|page_tree| page_tree.id == id)
         };
         match remove_idx {
-            Some(idx) => return Some(self.children.borrow_mut().remove(idx).unwrap()),
+            Some(idx) => Some(self.children.borrow_mut().remove(idx).unwrap()),
             None => {
-                for page_tree in self.children.borrow_mut().iter_mut() {
-                    match page_tree.remove(id) {
-                        found @ Some(_) => return found,
-                        None => (), // keep going...
-                    }
-                }
+                self.children
+                    .borrow_mut()
+                    .iter_mut()
+                    .filter_map(|page_tree| page_tree.remove(id))
+                    .next()
             }
         }
-        None
     }
 
     pub fn set_page_clip_rect_with_new_viewport(&self, viewport: Rect<f32>) -> bool {
@@ -274,18 +265,29 @@ impl Page {
         // because it was built for infinite clip (MAX_RECT).
         had_clip_rect
     }
+
+    pub fn send_title_to_compositor(&self) {
+        match *self.frame() {
+            None => {}
+            Some(ref frame) => {
+                let window = frame.window.root();
+                let document = frame.document.root();
+                window.compositor().set_title(self.id, Some(document.Title()));
+            }
+        }
+    }
 }
 
 impl Iterator<Rc<Page>> for PageIterator {
     fn next(&mut self) -> Option<Rc<Page>> {
-        if !self.stack.is_empty() {
-            let next = self.stack.pop().unwrap();
-            for child in next.children.borrow().iter() {
-                self.stack.push(child.clone());
-            }
-            Some(next.clone())
-        } else {
-            None
+        match self.stack.pop() {
+            Some(next) => {
+                for child in next.children.borrow().iter() {
+                    self.stack.push(child.clone());
+                }
+                Some(next)
+            },
+            None => None,
         }
     }
 }
@@ -361,12 +363,10 @@ impl Page {
     /// won't wait for the new layout computation to finish.
     ///
     /// If there is no window size yet, the page is presumed invisible and no reflow is performed.
-    ///
-    /// This function fails if there is no root frame.
     pub fn reflow(&self,
                   goal: ReflowGoal,
                   script_chan: ScriptControlChan,
-                  compositor: &mut ScriptListener,
+                  _: &mut ScriptListener,
                   query_type: ReflowQueryType) {
         let root = match *self.frame() {
             None => return,
@@ -385,9 +385,6 @@ impl Page {
 
                 // Now, join the layout so that they will see the latest changes we have made.
                 self.join_layout();
-
-                // Tell the user that we're performing layout.
-                compositor.set_ready_state(self.id, PerformingLayout);
 
                 // Layout will let us know when it's done.
                 let (join_chan, join_port) = channel();
@@ -437,11 +434,10 @@ impl Page {
     pub fn hit_test(&self, point: &Point2D<f32>) -> Option<UntrustedNodeAddress> {
         let frame = self.frame();
         let document = frame.as_ref().unwrap().document.root();
-        let root = document.GetDocumentElement().root();
-        if root.is_none() {
-            return None;
-        }
-        let root = root.unwrap();
+        let root = match document.GetDocumentElement().root() {
+            None => return None,
+            Some(root) => root,
+        };
         let root: JSRef<Node> = NodeCast::from_ref(*root);
         let address = match self.layout().hit_test(root.to_trusted_node_address(), *point) {
             Ok(HitTestResponse(node_address)) => {
@@ -458,11 +454,10 @@ impl Page {
     pub fn get_nodes_under_mouse(&self, point: &Point2D<f32>) -> Option<Vec<UntrustedNodeAddress>> {
         let frame = self.frame();
         let document = frame.as_ref().unwrap().document.root();
-        let root = document.GetDocumentElement().root();
-        if root.is_none() {
-            return None;
-        }
-        let root = root.unwrap();
+        let root = match document.GetDocumentElement().root() {
+            None => return None,
+            Some(root) => root,
+        };
         let root: JSRef<Node> = NodeCast::from_ref(*root);
         let address = match self.layout().mouse_over(root.to_trusted_node_address(), *point) {
             Ok(MouseOverResponse(node_address)) => {
@@ -478,9 +473,9 @@ impl Page {
 
 fn should_move_clip_rect(clip_rect: Rect<Au>, new_viewport: Rect<f32>) -> bool{
     let clip_rect = Rect(Point2D(geometry::to_frac_px(clip_rect.origin.x) as f32,
-                                    geometry::to_frac_px(clip_rect.origin.y) as f32),
-                            Size2D(geometry::to_frac_px(clip_rect.size.width) as f32,
-                                   geometry::to_frac_px(clip_rect.size.height) as f32));
+                                 geometry::to_frac_px(clip_rect.origin.y) as f32),
+                         Size2D(geometry::to_frac_px(clip_rect.size.width) as f32,
+                                geometry::to_frac_px(clip_rect.size.height) as f32));
 
     // We only need to move the clip rect if the viewport is getting near the edge of
     // our preexisting clip rect. We use half of the size of the viewport as a heuristic

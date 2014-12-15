@@ -27,7 +27,7 @@ use gfx::color;
 use gfx::display_list::{BaseDisplayItem, BorderDisplayItem, BorderDisplayItemClass, DisplayItem};
 use gfx::display_list::{DisplayList, GradientDisplayItem, GradientDisplayItemClass, GradientStop};
 use gfx::display_list::{ImageDisplayItem, ImageDisplayItemClass, LineDisplayItem, BorderRadii};
-use gfx::display_list::{LineDisplayItemClass, PseudoDisplayItemClass, SidewaysLeft, SidewaysRight};
+use gfx::display_list::{LineDisplayItemClass, SidewaysLeft, SidewaysRight};
 use gfx::display_list::{SolidColorDisplayItem, SolidColorDisplayItemClass, StackingContext};
 use gfx::display_list::{TextDisplayItem, TextDisplayItemClass, Upright};
 use gfx::paint_task::PaintLayer;
@@ -110,6 +110,12 @@ pub trait FragmentDisplayListBuilding {
                                                     display_list: &mut DisplayList,
                                                     abs_bounds: &Rect<Au>,
                                                     level: StackingLevel,
+                                                    clip_rect: &Rect<Au>);
+
+    fn build_display_list_for_outline_if_applicable(&self,
+                                                    style: &ComputedValues,
+                                                    display_list: &mut DisplayList,
+                                                    bounds: &Rect<Au>,
                                                     clip_rect: &Rect<Au>);
 
     fn build_debug_borders_around_text_fragments(&self,
@@ -439,6 +445,40 @@ impl FragmentDisplayListBuilding for Fragment {
         }), level);
     }
 
+    fn build_display_list_for_outline_if_applicable(&self,
+                                                    style: &ComputedValues,
+                                                    display_list: &mut DisplayList,
+                                                    bounds: &Rect<Au>,
+                                                    clip_rect: &Rect<Au>) {
+        let width = style.get_outline().outline_width;
+        if width == Au(0) {
+            return
+        }
+
+        let outline_style = style.get_outline().outline_style;
+        if outline_style == border_style::none {
+            return
+        }
+
+        // Outlines are not accounted for in the dimensions of the border box, so adjust the
+        // absolute bounds.
+        let mut bounds = *bounds;
+        bounds.origin.x = bounds.origin.x - width;
+        bounds.origin.y = bounds.origin.y - width;
+        bounds.size.width = bounds.size.width + width + width;
+        bounds.size.height = bounds.size.height + width + width;
+
+        // Append the outline to the display list.
+        let color = style.resolve_color(style.get_outline().outline_color).to_gfx_color();
+        display_list.outlines.push_back(BorderDisplayItemClass(box BorderDisplayItem {
+            base: BaseDisplayItem::new(bounds, self.node, *clip_rect),
+            border_widths: SideOffsets2D::new_all_same(width),
+            color: SideOffsets2D::new_all_same(color),
+            style: SideOffsets2D::new_all_same(outline_style),
+            radius: Default::default(),
+        }))
+    }
+
     fn build_debug_borders_around_text_fragments(&self,
                                                  display_list: &mut DisplayList,
                                                  flow_origin: Point2D<Au>,
@@ -550,12 +590,6 @@ impl FragmentDisplayListBuilding for Fragment {
             let level =
                 StackingLevel::from_background_and_border_level(background_and_border_level);
 
-            // Add a pseudo-display item for content box queries. This is a very bogus thing to do.
-            let base_display_item = box BaseDisplayItem::new(absolute_fragment_bounds,
-                                                             self.node,
-                                                             *clip_rect);
-            display_list.push(PseudoDisplayItemClass(base_display_item), level);
-
             // Add the background to the list, if applicable.
             match self.inline_context {
                 Some(ref inline_context) => {
@@ -584,9 +618,7 @@ impl FragmentDisplayListBuilding for Fragment {
                 }
             }
 
-            // Add a border, if applicable.
-            //
-            // TODO: Outlines.
+            // Add a border and outlines, if applicable.
             match self.inline_context {
                 Some(ref inline_context) => {
                     for style in inline_context.styles.iter().rev() {
@@ -595,6 +627,11 @@ impl FragmentDisplayListBuilding for Fragment {
                             display_list,
                             &absolute_fragment_bounds,
                             level,
+                            clip_rect);
+                        self.build_display_list_for_outline_if_applicable(
+                            &**style,
+                            display_list,
+                            &absolute_fragment_bounds,
                             clip_rect);
                     }
                 }
@@ -608,6 +645,11 @@ impl FragmentDisplayListBuilding for Fragment {
                         display_list,
                         &absolute_fragment_bounds,
                         level,
+                        clip_rect);
+                    self.build_display_list_for_outline_if_applicable(
+                        &*self.style,
+                        display_list,
+                        &absolute_fragment_bounds,
                         clip_rect);
                 }
             }
@@ -876,8 +918,8 @@ impl BlockFlowDisplayListBuilding for BlockFlow {
         let stacking_context =
             self.create_stacking_context(display_list,
                                          Some(Arc::new(PaintLayer::new(self.layer_id(0),
-                                                                        transparent,
-                                                                        scroll_policy))));
+                                                                       transparent,
+                                                                       scroll_policy))));
         self.base.display_list_building_result = StackingContextResult(stacking_context)
     }
 

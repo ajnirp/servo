@@ -3,6 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use azure::azure_hl::Color;
+use constellation_msg::{Key, KeyState, KeyModifiers};
 use geom::point::Point2D;
 use geom::rect::Rect;
 use layers::platform::surface::NativeGraphicsMetadata;
@@ -19,7 +20,7 @@ pub enum PaintState {
     PaintingPaintState,
 }
 
-#[deriving(Eq, Ord, PartialEq, PartialOrd, Clone)]
+#[deriving(Eq, Ord, PartialEq, PartialOrd, Clone, Show)]
 pub enum ReadyState {
     /// Informs the compositor that nothing has been done yet. Used for setting status
     Blank,
@@ -111,6 +112,9 @@ pub trait ScriptListener {
                              pipeline_id: PipelineId,
                              layer_id: LayerId,
                              point: Point2D<f32>);
+    /// Informs the compositor that the title of the page with the given pipeline ID has changed.
+    fn set_title(&mut self, pipeline_id: PipelineId, new_title: Option<String>);
     fn close(&mut self);
     fn dup(&mut self) -> Box<ScriptListener+'static>;
+    fn send_key_event(&mut self, key: Key, state: KeyState, modifiers: KeyModifiers);
 }

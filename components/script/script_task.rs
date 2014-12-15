@@ -35,7 +35,7 @@ use page::{Page, IterablePage, Frame};
 use timers::TimerId;
 use devtools;
 
-use devtools_traits::{DevtoolsControlChan, DevtoolsControlPort, NewGlobal, GetRootNode};
+use devtools_traits::{DevtoolsControlChan, DevtoolsControlPort, NewGlobal, GetRootNode, DevtoolsPageInfo};
 use devtools_traits::{DevtoolScriptControlMsg, EvaluateJS, GetDocumentElement};
 use devtools_traits::{GetChildren, GetLayout, ModifyAttribute};
 use script_traits::{CompositorEvent, ResizeEvent, ReflowEvent, ClickEvent, MouseDownEvent};
@@ -43,10 +43,12 @@ use script_traits::{MouseMoveEvent, MouseUpEvent, ConstellationControlMsg, Scrip
 use script_traits::{ResizeMsg, AttachLayoutMsg, LoadMsg, ViewportMsg, SendEventMsg};
 use script_traits::{ResizeInactiveMsg, ExitPipelineMsg, NewLayoutInfo, OpaqueScriptLayoutChannel};
 use script_traits::{ScriptControlChan, ReflowCompleteMsg, UntrustedNodeAddress, KeyEvent};
-use servo_msg::compositor_msg::{FinishedLoading, LayerId, Loading};
+use script_traits::{GetTitleMsg};
+use servo_msg::compositor_msg::{FinishedLoading, LayerId, Loading, PerformingLayout};
 use servo_msg::compositor_msg::{ScriptListener};
-use servo_msg::constellation_msg::{ConstellationChan, LoadCompleteMsg, LoadUrlMsg, NavigationDirection};
-use servo_msg::constellation_msg::{LoadData, PipelineId, Failure, FailureMsg, WindowSizeData, Key, KeyState};
+use servo_msg::constellation_msg::{ConstellationChan, LoadCompleteMsg};
+use servo_msg::constellation_msg::{LoadData, LoadUrlMsg, NavigationDirection, PipelineId};
+use servo_msg::constellation_msg::{Failure, FailureMsg, WindowSizeData, Key, KeyState};
 use servo_msg::constellation_msg::{KeyModifiers, SUPER, SHIFT, CONTROL, ALT, Repeated, Pressed};
 use servo_msg::constellation_msg::{Released};
 use servo_msg::constellation_msg;
@@ -183,6 +185,7 @@ pub struct ScriptTask {
     /// For receiving commands from an optional devtools server. Will be ignored if
     /// no such server exists.
     devtools_port: DevtoolsControlPort,
+    devtools_sender: Sender<DevtoolScriptControlMsg>,
 
     /// The JavaScript runtime.
     js_runtime: js::rust::rt,
@@ -342,13 +345,7 @@ impl ScriptTask {
                              constellation_chan.clone(),
                              js_context.clone());
 
-        // Notify devtools that a new script global exists.
-        //FIXME: Move this into handle_load after we create a window instead.
         let (devtools_sender, devtools_receiver) = channel();
-        devtools_chan.as_ref().map(|chan| {
-            chan.send(NewGlobal(id, devtools_sender.clone()));
-        });
-
         ScriptTask {
             page: DOMRefCell::new(Rc::new(page)),
 
@@ -363,6 +360,7 @@ impl ScriptTask {
             compositor: DOMRefCell::new(compositor),
             devtools_chan: devtools_chan,
             devtools_port: devtools_receiver,
+            devtools_sender: devtools_sender,
 
             js_runtime: js_runtime,
             js_context: DOMRefCell::new(Some(js_context)),
@@ -535,32 +533,11 @@ impl ScriptTask {
         // Process the gathered events.
         for msg in sequential.into_iter() {
             match msg {
-                // TODO(tkuehn) need to handle auxiliary layouts for iframes
-                FromConstellation(AttachLayoutMsg(_)) => panic!("should have handled AttachLayoutMsg already"),
-                FromConstellation(LoadMsg(id, load_data)) => self.load(id, load_data),
-                FromScript(TriggerLoadMsg(id, load_data)) => self.trigger_load(id, load_data),
-                FromScript(TriggerFragmentMsg(id, url)) => self.trigger_fragment(id, url),
-                FromConstellation(SendEventMsg(id, event)) => self.handle_event(id, event),
-                FromScript(FireTimerMsg(FromWindow(id), timer_id)) => self.handle_fire_timer_msg(id, timer_id),
-                FromScript(FireTimerMsg(FromWorker, _)) => panic!("Worker timeouts must not be sent to script task"),
-                FromScript(NavigateMsg(direction)) => self.handle_navigate_msg(direction),
-                FromConstellation(ReflowCompleteMsg(id, reflow_id)) => self.handle_reflow_complete_msg(id, reflow_id),
-                FromConstellation(ResizeInactiveMsg(id, new_size)) => self.handle_resize_inactive_msg(id, new_size),
-                FromConstellation(ExitPipelineMsg(id)) => if self.handle_exit_pipeline_msg(id) { return false },
-                FromConstellation(ViewportMsg(..)) => panic!("should have handled ViewportMsg already"),
-                FromScript(ExitWindowMsg(id)) => self.handle_exit_window_msg(id),
-                FromConstellation(ResizeMsg(..)) => panic!("should have handled ResizeMsg already"),
-                FromScript(XHRProgressMsg(addr, progress)) => XMLHttpRequest::handle_progress(addr, progress),
-                FromScript(XHRReleaseMsg(addr)) => XMLHttpRequest::handle_release(addr),
-                FromScript(DOMMessage(..)) => panic!("unexpected message"),
-                FromScript(WorkerPostMessage(addr, data, nbytes)) => Worker::handle_message(addr, data, nbytes),
-                FromScript(WorkerRelease(addr)) => Worker::handle_release(addr),
-                FromDevtools(EvaluateJS(id, s, reply)) => devtools::handle_evaluate_js(&*self.page.borrow(), id, s, reply),
-                FromDevtools(GetRootNode(id, reply)) => devtools::handle_get_root_node(&*self.page.borrow(), id, reply),
-                FromDevtools(GetDocumentElement(id, reply)) => devtools::handle_get_document_element(&*self.page.borrow(), id, reply),
-                FromDevtools(GetChildren(id, node_id, reply)) => devtools::handle_get_children(&*self.page.borrow(), id, node_id, reply),
-                FromDevtools(GetLayout(id, node_id, reply)) => devtools::handle_get_layout(&*self.page.borrow(), id, node_id, reply),
-                FromDevtools(ModifyAttribute(id, node_id, modifications)) => devtools::handle_modify_attribute(&*self.page.borrow(), id, node_id, modifications),
+                FromConstellation(ExitPipelineMsg(id)) =>
+                    if self.handle_exit_pipeline_msg(id) { return false },
+                FromConstellation(inner_msg) => self.handle_msg_from_constellation(inner_msg),
+                FromScript(inner_msg) => self.handle_msg_from_script(inner_msg),
+                FromDevtools(inner_msg) => self.handle_msg_from_devtools(inner_msg),
             }
         }
 
@@ -570,6 +547,74 @@ impl ScriptTask {
         }
 
         true
+    }
+
+    fn handle_msg_from_constellation(&self, msg: ConstellationControlMsg) {
+        match msg {
+            // TODO(tkuehn) need to handle auxiliary layouts for iframes
+            AttachLayoutMsg(_) =>
+                panic!("should have handled AttachLayoutMsg already"),
+            LoadMsg(id, load_data) =>
+                self.load(id, load_data),
+            SendEventMsg(id, event) =>
+                self.handle_event(id, event),
+            ReflowCompleteMsg(id, reflow_id) =>
+                self.handle_reflow_complete_msg(id, reflow_id),
+            ResizeInactiveMsg(id, new_size) =>
+                self.handle_resize_inactive_msg(id, new_size),
+            ViewportMsg(..) =>
+                panic!("should have handled ViewportMsg already"),
+            ResizeMsg(..) =>
+                panic!("should have handled ResizeMsg already"),
+            ExitPipelineMsg(..) =>
+                panic!("should have handled ExitPipelineMsg already"),
+            GetTitleMsg(pipeline_id) =>
+                self.handle_get_title_msg(pipeline_id),
+        }
+    }
+
+    fn handle_msg_from_script(&self, msg: ScriptMsg) {
+        match msg {
+            TriggerLoadMsg(id, load_data) =>
+                self.trigger_load(id, load_data),
+            TriggerFragmentMsg(id, url) =>
+                self.trigger_fragment(id, url),
+            FireTimerMsg(FromWindow(id), timer_id) =>
+                self.handle_fire_timer_msg(id, timer_id),
+            FireTimerMsg(FromWorker, _) =>
+                panic!("Worker timeouts must not be sent to script task"),
+            NavigateMsg(direction) =>
+                self.handle_navigate_msg(direction),
+            ExitWindowMsg(id) =>
+                self.handle_exit_window_msg(id),
+            XHRProgressMsg(addr, progress) =>
+                XMLHttpRequest::handle_progress(addr, progress),
+            XHRReleaseMsg(addr) =>
+                XMLHttpRequest::handle_release(addr),
+            DOMMessage(..) =>
+                panic!("unexpected message"),
+            WorkerPostMessage(addr, data, nbytes) =>
+                Worker::handle_message(addr, data, nbytes),
+            WorkerRelease(addr) =>
+                Worker::handle_release(addr),
+        }
+    }
+
+    fn handle_msg_from_devtools(&self, msg: DevtoolScriptControlMsg) {
+        match msg {
+            EvaluateJS(id, s, reply) =>
+                devtools::handle_evaluate_js(&*self.page.borrow(), id, s, reply),
+            GetRootNode(id, reply) =>
+                devtools::handle_get_root_node(&*self.page.borrow(), id, reply),
+            GetDocumentElement(id, reply) =>
+                devtools::handle_get_document_element(&*self.page.borrow(), id, reply),
+            GetChildren(id, node_id, reply) =>
+                devtools::handle_get_children(&*self.page.borrow(), id, node_id, reply),
+            GetLayout(id, node_id, reply) =>
+                devtools::handle_get_layout(&*self.page.borrow(), id, node_id, reply),
+            ModifyAttribute(id, node_id, modifications) =>
+                devtools::handle_modify_attribute(&*self.page.borrow(), id, node_id, modifications),
+        }
     }
 
     fn handle_new_layout(&self, new_layout_info: NewLayoutInfo) {
@@ -659,6 +704,11 @@ impl ScriptTask {
         // so this can afford to be naive and just shut down the
         // compositor. In the future it'll need to be smarter.
         self.compositor.borrow_mut().close();
+    }
+
+    /// Handles a request for the window title.
+    fn handle_get_title_msg(&self, pipeline_id: PipelineId) {
+        get_page(&*self.page.borrow(), pipeline_id).send_title_to_compositor();
     }
 
     /// Handles a request to exit the script task and shut down layout.
@@ -784,6 +834,7 @@ impl ScriptTask {
         parse_html(*document, parser_input, &final_url);
 
         document.set_ready_state(DocumentReadyStateValues::Interactive);
+        self.compositor.borrow_mut().set_ready_state(pipeline_id, PerformingLayout);
 
         // Kick off the initial reflow of the page.
         debug!("kicking off initial reflow of {}", final_url);
@@ -813,10 +864,23 @@ impl ScriptTask {
         let wintarget: JSRef<EventTarget> = EventTargetCast::from_ref(*window);
         let _ = wintarget.dispatch_event_with_target(Some(doctarget), *event);
 
-        *page.fragment_name.borrow_mut() = final_url.fragment;
+        *page.fragment_name.borrow_mut() = final_url.fragment.clone();
 
         let ConstellationChan(ref chan) = self.constellation_chan;
         chan.send(LoadCompleteMsg);
+
+        // Notify devtools that a new script global exists.
+        match self.devtools_chan {
+            None => {}
+            Some(ref chan) => {
+                let page_info = DevtoolsPageInfo {
+                    title: document.Title(),
+                    url: final_url
+                };
+                chan.send(NewGlobal(pipeline_id, self.devtools_sender.clone(),
+                                    page_info));
+            }
+        }
     }
 
     fn scroll_fragment_point(&self, pipeline_id: PipelineId, node: JSRef<Element>) {
@@ -933,6 +997,10 @@ impl ScriptTask {
             let ev = EventCast::from_ref(*event);
             prevented = ev.DefaultPrevented();
             // TODO: if keypress event is canceled, prevent firing input events
+        }
+
+        if !prevented {
+            self.compositor.borrow_mut().send_key_event(key, state, modifiers);
         }
 
         // This behavior is unspecced

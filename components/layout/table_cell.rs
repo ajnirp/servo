@@ -45,10 +45,8 @@ impl TableCellFlow {
 
     /// Assign block-size for table-cell flow.
     ///
-    /// TODO(#2015, pcwalton): This doesn't handle floats right.
-    ///
     /// inline(always) because this is only ever called by in-order or non-in-order top-level
-    /// methods
+    /// methods.
     #[inline(always)]
     fn assign_block_size_table_cell_base<'a>(&mut self, layout_context: &'a LayoutContext<'a>) {
         self.block_flow.assign_block_size_block_base(layout_context, MarginsMayNotCollapse)
@@ -98,7 +96,7 @@ impl Flow for TableCellFlow {
     /// Recursively (top-down) determines the actual inline-size of child contexts and fragments.
     /// When called on this context, the context has had its inline-size set by the parent table
     /// row.
-    fn assign_inline_sizes(&mut self, ctx: &LayoutContext) {
+    fn assign_inline_sizes(&mut self, layout_context: &LayoutContext) {
         let _scope = layout_debug_scope!("table_cell::assign_inline_sizes {:x}",
                                             self.block_flow.base.debug_id());
         debug!("assign_inline_sizes({}): assigning inline_size for flow", "table_cell");
@@ -109,7 +107,7 @@ impl Flow for TableCellFlow {
         let inline_size_computer = InternalTable;
 
         inline_size_computer.compute_used_inline_size(&mut self.block_flow,
-                                                      ctx,
+                                                      layout_context,
                                                       containing_block_inline_size);
 
         let inline_start_content_edge =
@@ -119,7 +117,8 @@ impl Flow for TableCellFlow {
         let content_inline_size =
             self.block_flow.fragment.border_box.size.inline - padding_and_borders;
 
-        self.block_flow.propagate_assigned_inline_size_to_children(inline_start_content_edge,
+        self.block_flow.propagate_assigned_inline_size_to_children(layout_context,
+                                                                   inline_start_content_edge,
                                                                    content_inline_size,
                                                                    None);
     }

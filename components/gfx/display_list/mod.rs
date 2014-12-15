@@ -75,6 +75,8 @@ pub struct DisplayList {
     pub floats: DList<DisplayItem>,
     /// All other content.
     pub content: DList<DisplayItem>,
+    /// Outlines: step 10.
+    pub outlines: DList<DisplayItem>,
     /// Child stacking contexts.
     pub children: DList<Arc<StackingContext>>,
 }
@@ -88,6 +90,7 @@ impl DisplayList {
             block_backgrounds_and_borders: DList::new(),
             floats: DList::new(),
             content: DList::new(),
+            outlines: DList::new(),
             children: DList::new(),
         }
     }
@@ -102,12 +105,14 @@ impl DisplayList {
                                  &mut other.block_backgrounds_and_borders);
         servo_dlist::append_from(&mut self.floats, &mut other.floats);
         servo_dlist::append_from(&mut self.content, &mut other.content);
+        servo_dlist::append_from(&mut self.outlines, &mut other.outlines);
         servo_dlist::append_from(&mut self.children, &mut other.children);
     }
 
     /// Merges all display items from all non-float stacking levels to the `float` stacking level.
     #[inline]
     pub fn form_float_pseudo_stacking_context(&mut self) {
+        servo_dlist::prepend_from(&mut self.floats, &mut self.outlines);
         servo_dlist::prepend_from(&mut self.floats, &mut self.content);
         servo_dlist::prepend_from(&mut self.floats, &mut self.block_backgrounds_and_borders);
         servo_dlist::prepend_from(&mut self.floats, &mut self.background_and_borders);
@@ -127,6 +132,9 @@ impl DisplayList {
             result.push((*display_item).clone())
         }
         for display_item in self.content.iter() {
+            result.push((*display_item).clone())
+        }
+        for display_item in self.outlines.iter() {
             result.push((*display_item).clone())
         }
         result
@@ -282,7 +290,10 @@ impl StackingContext {
                 }
             }
 
-            // TODO(pcwalton): Step 10: Outlines.
+            // Step 10: Outlines.
+            for display_item in display_list.outlines.iter() {
+                display_item.draw_into_context(&mut paint_subcontext)
+            }
 
             // Undo our clipping and transform.
             if paint_subcontext.transient_clip_rect.is_some() {
@@ -349,6 +360,12 @@ impl StackingContext {
         // Iterate through display items in reverse stacking order. Steps here refer to the
         // painting steps in CSS 2.1 Appendix E.
         //
+        // Step 10: Outlines.
+        hit_test_in_list(point, result, topmost_only, self.display_list.outlines.iter().rev());
+        if topmost_only && !result.is_empty() {
+            return
+        }
+
         // Steps 9 and 8: Positioned descendants with nonnegative z-indices.
         for kid in self.display_list.children.iter().rev() {
             if kid.z_index < 0 {
@@ -420,13 +437,6 @@ pub enum DisplayItem {
     BorderDisplayItemClass(Box<BorderDisplayItem>),
     GradientDisplayItemClass(Box<GradientDisplayItem>),
     LineDisplayItemClass(Box<LineDisplayItem>),
-
-    /// A pseudo-display item that exists only so that queries like `ContentBoxQuery` and
-    /// `ContentBoxesQuery` can be answered.
-    ///
-    /// FIXME(pcwalton): This is really bogus. Those queries should not consult the display list
-    /// but should instead consult the flow/box tree.
-    PseudoDisplayItemClass(Box<BaseDisplayItem>),
 }
 
 /// Information common to all display items.
@@ -639,8 +649,6 @@ impl DisplayItem {
                                           line.color,
                                           line.style)
             }
-
-            PseudoDisplayItemClass(_) => {}
         }
     }
 
@@ -652,7 +660,6 @@ impl DisplayItem {
             BorderDisplayItemClass(ref border) => &border.base,
             GradientDisplayItemClass(ref gradient) => &gradient.base,
             LineDisplayItemClass(ref line) => &line.base,
-            PseudoDisplayItemClass(ref base) => &**base,
         }
     }
 
@@ -664,7 +671,6 @@ impl DisplayItem {
             BorderDisplayItemClass(ref mut border) => &mut border.base,
             GradientDisplayItemClass(ref mut gradient) => &mut gradient.base,
             LineDisplayItemClass(ref mut line) => &mut line.base,
-            PseudoDisplayItemClass(ref mut base) => &mut **base,
         }
     }
 
@@ -691,7 +697,6 @@ impl fmt::Show for DisplayItem {
                 BorderDisplayItemClass(_) => "Border",
                 GradientDisplayItemClass(_) => "Gradient",
                 LineDisplayItemClass(_) => "Line",
-                PseudoDisplayItemClass(_) => "Pseudo",
             },
             self.base().bounds,
             self.base().node.id()

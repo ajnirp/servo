@@ -125,7 +125,7 @@ fn parse_value_as_length(value: &ComponentValue) -> Result<Au, ()> {
     // http://dev.w3.org/csswg/mediaqueries3/ - Section 6
     // em units are relative to the initial font-size.
     let initial_font_size = longhands::font_size::get_initial_value();
-    Ok(computed::compute_Au_with_font_size(length, initial_font_size))
+    Ok(computed::compute_Au_with_font_size(length, initial_font_size, initial_font_size))
 }
 
 fn parse_media_query_expression(iter: ParserIter) -> Result<Expression, ()> {
@@ -262,7 +262,7 @@ pub fn parse_media_query_list(input: &[ComponentValue]) -> MediaQueryList {
             }
 
             // Add the media query if it was valid and no trailing tokens were found.
-            // Otherwse, create a 'not all' media query, that will never match.
+            // Otherwise, create a 'not all' media query, that will never match.
             let media_query = match (media_query_result, trailing_tokens) {
                 (Ok(media_query), false) => media_query,
                 _ => MediaQuery::new(Some(Not), All, vec!()),

@@ -187,3 +187,16 @@ fragment=top != ../html/acid2.html acid2_ref.html
 == incremental_float_a.html incremental_float_ref.html
 == opacity_simple_a.html opacity_simple_ref.html
 == opacity_stacking_context_a.html opacity_stacking_context_ref.html
+== text_transform_none_a.html text_transform_none_ref.html
+== text_transform_uppercase_a.html text_transform_uppercase_ref.html
+== text_transform_lowercase_a.html text_transform_lowercase_ref.html
+== text_transform_capitalize_a.html text_transform_capitalize_ref.html
+== outlines_simple_a.html outlines_simple_ref.html
+== outlines_wrap_a.html outlines_wrap_ref.html
+== letter_spacing_a.html letter_spacing_ref.html
+!= border_black_groove.html border_black_solid.html
+!= border_black_ridge.html border_black_solid.html
+!= border_black_ridge.html border_black_groove.html
+== text_indent_a.html text_indent_ref.html
+== word_spacing_a.html word_spacing_ref.html
+== overflow_wrap_a.html overflow_wrap_ref.html
