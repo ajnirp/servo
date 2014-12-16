@@ -45,6 +45,10 @@ class MachCommands(CommandBase):
         env = self.build_env()
         env["RUST_BACKTRACE"] = "1"
 
+        for index, param in enumerate(params):
+            if param.startswith('view-source:'):
+                params[index] = 'view-source+' + param[12:]
+
         args = [path.join("components", "servo", "target", "servo")]
 
         # Borrowed and modified from:
