@@ -11,7 +11,6 @@ use http_loader;
 use sniffer_task;
 use sniffer_task::SnifferTask;
 
-use std::str;
 use std::comm::{channel, Receiver, Sender};
 use hyper::mime::{Mime, Charset};
 use hyper::header::Headers;
@@ -221,18 +220,12 @@ impl ResourceManager {
     }
 
     fn load(&self, load_data: LoadData) {
-        println!("huehuehue {}", load_data.url.scheme.as_slice());
         let mut load_data = load_data;
         self.user_agent.as_ref().map(|ua| load_data.headers.set(UserAgent(ua.clone())));
         let senders = ResponseSenders {
             immediate_consumer: self.sniffer_task.clone(),
             eventual_consumer: load_data.consumer.clone(),
         };
-
-        let url_scheme = load_data.url.scheme.clone();
-        if url_scheme.as_slice() == "view-source" {
-            load_data.url.scheme = str::replace(url_scheme.as_slice(), "view-source:", "view-source+");
-        }
 
         let loader = match load_data.url.scheme.as_slice() {
             "file" => file_loader::factory,

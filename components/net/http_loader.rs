@@ -34,7 +34,7 @@ fn load(load_data: LoadData, start_chan: Sender<TargetedLoadResponse>) {
     // FIXME: At the time of writing this FIXME, servo didn't have any central
     //        location for configuration. If you're reading this and such a
     //        repository DOES exist, please update this constant to use it.
-    println!("topkek1 {} {}", load_data.url.scheme, load_data.url.scheme_data);
+    println!("{}", load_data.url.serialize());
     let max_redirects = 50u;
     let mut iters = 0u;
     let mut url = load_data.url.clone();
@@ -67,7 +67,9 @@ fn load(load_data: LoadData, start_chan: Sender<TargetedLoadResponse>) {
             "http" | "https" => {},
             "view-source+http" | "view-source+https" => {
                 view_source = true;
-                url.scheme = url.scheme.slice(12, url.scheme.len()).to_string();
+                let serialized = url.serialize();
+                // remove the "view-source+" prefix
+                url = Url::parse(serialized.slice(12, serialized.len())).unwrap();
             }
             _ => {
                 let s = format!("{:s} request, but we don't support that scheme", url.scheme);
@@ -81,13 +83,10 @@ fn load(load_data: LoadData, start_chan: Sender<TargetedLoadResponse>) {
         let mut req = match Request::new(load_data.method.clone(), url.clone()) {
             Ok(req) => req,
             Err(e) => {
-                println!("topkek2 {} {}", url.scheme, url.scheme_data);
                 send_error(url, e.to_string(), senders);
                 return;
             }
         };
-
-        println!("topkek3 {}", load_data.url.scheme.as_slice());
 
         // Preserve the `host` header set automatically by Request.
         let host = req.headers().get::<Host>().unwrap().clone();
