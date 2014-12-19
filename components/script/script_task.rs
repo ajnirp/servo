@@ -6,30 +6,29 @@
 //! and layout tasks.
 
 use dom::bindings::cell::DOMRefCell;
-use dom::bindings::codegen::Bindings::DocumentBinding::{DocumentMethods, DocumentReadyStateValues};
+use dom::bindings::codegen::Bindings::DocumentBinding::{DocumentMethods, DocumentReadyState};
 use dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use dom::bindings::codegen::Bindings::EventTargetBinding::EventTargetMethods;
 use dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use dom::bindings::codegen::InheritTypes::{ElementCast, EventTargetCast, NodeCast, EventCast};
-use dom::bindings::conversions::{FromJSValConvertible, Empty};
-use dom::bindings::global;
+use dom::bindings::conversions::FromJSValConvertible;
+use dom::bindings::conversions::StringificationBehavior;
+use dom::bindings::global::GlobalRef;
 use dom::bindings::js::{JS, JSRef, RootCollection, Temporary, OptionalRootable};
 use dom::bindings::trace::JSTraceable;
 use dom::bindings::utils::{wrap_for_same_compartment, pre_wrap};
-use dom::document::{Document, HTMLDocument, DocumentHelpers, FromParser};
-use dom::element::{Element, HTMLButtonElementTypeId, HTMLInputElementTypeId};
-use dom::element::{HTMLSelectElementTypeId, HTMLTextAreaElementTypeId, HTMLOptionElementTypeId, ActivationElementHelpers};
-use dom::event::{Event, EventHelpers, Bubbles, DoesNotBubble, Cancelable, NotCancelable};
+use dom::document::{Document, IsHTMLDocument, DocumentHelpers, DocumentSource};
+use dom::element::{Element, ElementTypeId, ActivationElementHelpers};
+use dom::event::{Event, EventHelpers, EventBubbles, EventCancelable};
 use dom::uievent::UIEvent;
 use dom::eventtarget::{EventTarget, EventTargetHelpers};
 use dom::keyboardevent::KeyboardEvent;
-use dom::node;
-use dom::node::{ElementNodeTypeId, Node, NodeHelpers};
+use dom::node::{mod, Node, NodeHelpers, NodeDamage, NodeTypeId};
 use dom::window::{Window, WindowHelpers};
 use dom::worker::{Worker, TrustedWorkerAddress};
 use dom::xmlhttprequest::{TrustedXHRAddress, XMLHttpRequest, XHRProgress};
-use parse::html::{InputString, InputUrl, parse_html};
-use layout_interface::{ScriptLayoutChan, LayoutChan, NoQuery, ReflowForDisplay};
+use parse::html::{HTMLInput, parse_html};
+use layout_interface::{ScriptLayoutChan, LayoutChan, ReflowGoal, ReflowQueryType};
 use layout_interface;
 use page::{Page, IterablePage, Frame};
 use timers::TimerId;
@@ -40,10 +39,9 @@ use devtools_traits::{DevtoolScriptControlMsg, EvaluateJS, GetDocumentElement};
 use devtools_traits::{GetChildren, GetLayout, ModifyAttribute};
 use script_traits::{CompositorEvent, ResizeEvent, ReflowEvent, ClickEvent, MouseDownEvent};
 use script_traits::{MouseMoveEvent, MouseUpEvent, ConstellationControlMsg, ScriptTaskFactory};
-use script_traits::{ResizeMsg, AttachLayoutMsg, LoadMsg, ViewportMsg, SendEventMsg};
+use script_traits::{ResizeMsg, AttachLayoutMsg, GetTitleMsg, KeyEvent, LoadMsg, ViewportMsg};
 use script_traits::{ResizeInactiveMsg, ExitPipelineMsg, NewLayoutInfo, OpaqueScriptLayoutChannel};
-use script_traits::{ScriptControlChan, ReflowCompleteMsg, UntrustedNodeAddress, KeyEvent};
-use script_traits::{GetTitleMsg};
+use script_traits::{ScriptControlChan, ReflowCompleteMsg, SendEventMsg};
 use servo_msg::compositor_msg::{FinishedLoading, LayerId, Loading, PerformingLayout};
 use servo_msg::compositor_msg::{ScriptListener};
 use servo_msg::constellation_msg::{ConstellationChan, LoadCompleteMsg};
@@ -57,7 +55,7 @@ use servo_net::resource_task::{ResourceTask, Load};
 use servo_net::resource_task::LoadData as NetLoadData;
 use servo_net::storage_task::StorageTask;
 use servo_util::geometry::to_frac_px;
-use servo_util::smallvec::{SmallVec1, SmallVec};
+use servo_util::smallvec::SmallVec;
 use servo_util::task::spawn_named_with_send_on_failure;
 use servo_util::task_state;
 
@@ -74,7 +72,6 @@ use url::Url;
 
 use libc::size_t;
 use std::any::{Any, AnyRefExt};
-use std::collections::HashSet;
 use std::comm::{channel, Sender, Receiver, Select};
 use std::fmt::{mod, Show};
 use std::mem::replace;
@@ -94,24 +91,24 @@ pub enum TimerSource {
 pub enum ScriptMsg {
     /// Acts on a fragment URL load on the specified pipeline (only dispatched
     /// to ScriptTask).
-    TriggerFragmentMsg(PipelineId, Url),
+    TriggerFragment(PipelineId, Url),
     /// Begins a content-initiated load on the specified pipeline (only
     /// dispatched to ScriptTask).
-    TriggerLoadMsg(PipelineId, LoadData),
+    TriggerLoad(PipelineId, LoadData),
     /// Instructs the script task to send a navigate message to
     /// the constellation (only dispatched to ScriptTask).
-    NavigateMsg(NavigationDirection),
+    Navigate(NavigationDirection),
     /// Fires a JavaScript timeout
     /// TimerSource must be FromWindow when dispatched to ScriptTask and
     /// must be FromWorker when dispatched to a DedicatedGlobalWorkerScope
-    FireTimerMsg(TimerSource, TimerId),
+    FireTimer(TimerSource, TimerId),
     /// Notifies the script that a window associated with a particular pipeline
     /// should be closed (only dispatched to ScriptTask).
-    ExitWindowMsg(PipelineId),
+    ExitWindow(PipelineId),
     /// Notifies the script of progress on a fetch (dispatched to all tasks).
-    XHRProgressMsg(TrustedXHRAddress, XHRProgress),
+    XHRProgress(TrustedXHRAddress, XHRProgress),
     /// Releases one reference to the XHR object (dispatched to all tasks).
-    XHRReleaseMsg(TrustedXHRAddress),
+    XHRRelease(TrustedXHRAddress),
     /// Message sent through Worker.postMessage (only dispatched to
     /// DedicatedWorkerGlobalScope).
     DOMMessage(*mut u64, size_t),
@@ -238,12 +235,12 @@ trait PrivateScriptTaskHelpers {
 impl<'a> PrivateScriptTaskHelpers for JSRef<'a, Node> {
     fn click_event_filter_by_disabled_state(&self) -> bool {
         match self.type_id() {
-            ElementNodeTypeId(HTMLButtonElementTypeId) |
-            ElementNodeTypeId(HTMLInputElementTypeId) |
-            // ElementNodeTypeId(HTMLKeygenElementTypeId) |
-            ElementNodeTypeId(HTMLOptionElementTypeId) |
-            ElementNodeTypeId(HTMLSelectElementTypeId) |
-            ElementNodeTypeId(HTMLTextAreaElementTypeId) if self.get_disabled_state() => true,
+            NodeTypeId::Element(ElementTypeId::HTMLButtonElement) |
+            NodeTypeId::Element(ElementTypeId::HTMLInputElement) |
+            // NodeTypeId::Element(ElementTypeId::HTMLKeygenElement) |
+            NodeTypeId::Element(ElementTypeId::HTMLOptionElement) |
+            NodeTypeId::Element(ElementTypeId::HTMLSelectElement) |
+            NodeTypeId::Element(ElementTypeId::HTMLTextAreaElement) if self.get_disabled_state() => true,
             _ => false
         }
     }
@@ -470,17 +467,15 @@ impl ScriptTask {
             }
             let ret = sel.wait();
             if ret == port1.id() {
-                FromScript(self.port.recv())
+                MixedMessage::FromScript(self.port.recv())
             } else if ret == port2.id() {
-                FromConstellation(self.control_port.recv())
+                MixedMessage::FromConstellation(self.control_port.recv())
             } else if ret == port3.id() {
-                FromDevtools(self.devtools_port.recv())
+                MixedMessage::FromDevtools(self.devtools_port.recv())
             } else {
                 panic!("unexpected select result")
             }
         };
-
-        let mut needs_reflow = HashSet::new();
 
         // Squash any pending resize and reflow events in the queue.
         loop {
@@ -488,26 +483,20 @@ impl ScriptTask {
                 // This has to be handled before the ResizeMsg below,
                 // otherwise the page may not have been added to the
                 // child list yet, causing the find() to fail.
-                FromConstellation(AttachLayoutMsg(new_layout_info)) => {
+                MixedMessage::FromConstellation(AttachLayoutMsg(new_layout_info)) => {
                     self.handle_new_layout(new_layout_info);
                 }
-                FromConstellation(ResizeMsg(id, size)) => {
+                MixedMessage::FromConstellation(ResizeMsg(id, size)) => {
                     let page = self.page.borrow_mut();
                     let page = page.find(id).expect("resize sent to nonexistent pipeline");
                     page.resize_event.set(Some(size));
                 }
-                FromConstellation(SendEventMsg(id, ReflowEvent(node_addresses))) => {
-                    let page = self.page.borrow_mut();
-                    let inner_page = page.find(id).expect("Reflow sent to nonexistent pipeline");
-                    let mut pending = inner_page.pending_dirty_nodes.borrow_mut();
-                    pending.push_all_move(node_addresses);
-                    needs_reflow.insert(id);
-                }
-                FromConstellation(ViewportMsg(id, rect)) => {
+                MixedMessage::FromConstellation(ViewportMsg(id, rect)) => {
                     let page = self.page.borrow_mut();
                     let inner_page = page.find(id).expect("Page rect message sent to nonexistent pipeline");
                     if inner_page.set_page_clip_rect_with_new_viewport(rect) {
-                        needs_reflow.insert(id);
+                        let page = get_page(&*page, id);
+                        self.force_reflow(&*page);
                     }
                 }
                 _ => {
@@ -522,28 +511,23 @@ impl ScriptTask {
                 Err(_) => match self.port.try_recv() {
                     Err(_) => match self.devtools_port.try_recv() {
                         Err(_) => break,
-                        Ok(ev) => event = FromDevtools(ev),
+                        Ok(ev) => event = MixedMessage::FromDevtools(ev),
                     },
-                    Ok(ev) => event = FromScript(ev),
+                    Ok(ev) => event = MixedMessage::FromScript(ev),
                 },
-                Ok(ev) => event = FromConstellation(ev),
+                Ok(ev) => event = MixedMessage::FromConstellation(ev),
             }
         }
 
         // Process the gathered events.
         for msg in sequential.into_iter() {
             match msg {
-                FromConstellation(ExitPipelineMsg(id)) =>
+                MixedMessage::FromConstellation(ExitPipelineMsg(id)) =>
                     if self.handle_exit_pipeline_msg(id) { return false },
-                FromConstellation(inner_msg) => self.handle_msg_from_constellation(inner_msg),
-                FromScript(inner_msg) => self.handle_msg_from_script(inner_msg),
-                FromDevtools(inner_msg) => self.handle_msg_from_devtools(inner_msg),
+                MixedMessage::FromConstellation(inner_msg) => self.handle_msg_from_constellation(inner_msg),
+                MixedMessage::FromScript(inner_msg) => self.handle_msg_from_script(inner_msg),
+                MixedMessage::FromDevtools(inner_msg) => self.handle_msg_from_devtools(inner_msg),
             }
-        }
-
-        // Now process any pending reflows.
-        for id in needs_reflow.into_iter() {
-            self.handle_event(id, ReflowEvent(SmallVec1::new()));
         }
 
         true
@@ -575,27 +559,27 @@ impl ScriptTask {
 
     fn handle_msg_from_script(&self, msg: ScriptMsg) {
         match msg {
-            TriggerLoadMsg(id, load_data) =>
+            ScriptMsg::TriggerLoad(id, load_data) =>
                 self.trigger_load(id, load_data),
-            TriggerFragmentMsg(id, url) =>
+            ScriptMsg::TriggerFragment(id, url) =>
                 self.trigger_fragment(id, url),
-            FireTimerMsg(FromWindow(id), timer_id) =>
+            ScriptMsg::FireTimer(TimerSource::FromWindow(id), timer_id) =>
                 self.handle_fire_timer_msg(id, timer_id),
-            FireTimerMsg(FromWorker, _) =>
+            ScriptMsg::FireTimer(TimerSource::FromWorker, _) =>
                 panic!("Worker timeouts must not be sent to script task"),
-            NavigateMsg(direction) =>
+            ScriptMsg::Navigate(direction) =>
                 self.handle_navigate_msg(direction),
-            ExitWindowMsg(id) =>
+            ScriptMsg::ExitWindow(id) =>
                 self.handle_exit_window_msg(id),
-            XHRProgressMsg(addr, progress) =>
+            ScriptMsg::XHRProgress(addr, progress) =>
                 XMLHttpRequest::handle_progress(addr, progress),
-            XHRReleaseMsg(addr) =>
+            ScriptMsg::XHRRelease(addr) =>
                 XMLHttpRequest::handle_release(addr),
-            DOMMessage(..) =>
+            ScriptMsg::DOMMessage(..) =>
                 panic!("unexpected message"),
-            WorkerPostMessage(addr, data, nbytes) =>
+            ScriptMsg::WorkerPostMessage(addr, data, nbytes) =>
                 Worker::handle_message(addr, data, nbytes),
-            WorkerRelease(addr) =>
+            ScriptMsg::WorkerRelease(addr) =>
                 Worker::handle_release(addr),
         }
     }
@@ -666,11 +650,6 @@ impl ScriptTask {
         }
 
         self.compositor.borrow_mut().set_ready_state(pipeline_id, FinishedLoading);
-
-        if page.pending_reflows.get() > 0 {
-            page.pending_reflows.set(0);
-            self.force_reflow(&*page);
-        }
     }
 
     /// Handles a navigate forward or backward message.
@@ -748,15 +727,24 @@ impl ScriptTask {
             message for a layout channel that is not associated with this script task. This
             is a bug.");
 
-        let last_url = match &mut *page.mut_url() {
-            &Some((ref mut loaded, ref mut needs_reflow)) if *loaded == url => {
-                if replace(needs_reflow, false) {
-                    self.force_reflow(&*page);
-                }
-                return;
-            },
-            url => replace(url, None).map(|(loaded, _)| loaded),
+        // Are we reloading?
+        let reloading = match *page.url() {
+            Some((ref loaded, _)) => *loaded == url,
+            _ => false,
         };
+        if reloading {
+            // Pull out the `needs_reflow` flag explicitly because `reflow` can ask for the page's
+            // URL, and we can't be holding a borrow on that URL (#4402).
+            let needed_reflow = match &mut *page.mut_url() {
+                &Some((_, ref mut needs_reflow)) => replace(needs_reflow, false),
+                _ => panic!("can't reload a page with no URL!")
+            };
+            if needed_reflow {
+                self.force_reflow(&*page);
+            }
+            return
+        }
+        let last_url = replace(&mut *page.mut_url(), None).map(|(last_url, _)| last_url);
 
         let is_javascript = url.scheme.as_slice() == "javascript";
 
@@ -778,8 +766,9 @@ impl ScriptTask {
         } else {
             url.clone()
         };
-        let document = Document::new(*window, Some(doc_url.clone()), HTMLDocument,
-                                     None, FromParser).root();
+        let document = Document::new(*window, Some(doc_url.clone()),
+                                     IsHTMLDocument::HTMLDocument, None,
+                                     DocumentSource::FromParser).root();
 
         window.init_browser_context(*document);
 
@@ -823,23 +812,25 @@ impl ScriptTask {
                 *page.mut_url() = Some((final_url.clone(), true));
             }
 
-            (InputUrl(load_response), final_url)
+            (HTMLInput::InputUrl(load_response), final_url)
         } else {
             let evalstr = load_data.url.non_relative_scheme_data().unwrap();
             let jsval = window.evaluate_js_with_result(evalstr);
-            let strval = FromJSValConvertible::from_jsval(self.get_cx(), jsval, Empty);
-            (InputString(strval.unwrap_or("".to_string())), doc_url)
+            let strval = FromJSValConvertible::from_jsval(self.get_cx(), jsval,
+                                                          StringificationBehavior::Empty);
+            (HTMLInput::InputString(strval.unwrap_or("".to_string())), doc_url)
         };
 
         parse_html(*document, parser_input, &final_url);
 
-        document.set_ready_state(DocumentReadyStateValues::Interactive);
+        document.set_ready_state(DocumentReadyState::Interactive);
         self.compositor.borrow_mut().set_ready_state(pipeline_id, PerformingLayout);
 
         // Kick off the initial reflow of the page.
         debug!("kicking off initial reflow of {}", final_url);
-        document.content_changed(NodeCast::from_ref(*document));
-        window.flush_layout();
+        document.content_changed(NodeCast::from_ref(*document),
+                                 NodeDamage::OtherNodeDamage);
+        window.flush_layout(ReflowGoal::ForDisplay, ReflowQueryType::NoQuery);
 
         {
             // No more reflow required
@@ -848,8 +839,9 @@ impl ScriptTask {
         }
 
         // https://html.spec.whatwg.org/multipage/#the-end step 4
-        let event = Event::new(global::Window(*window), "DOMContentLoaded".to_string(),
-                               DoesNotBubble, NotCancelable).root();
+        let event = Event::new(GlobalRef::Window(*window), "DOMContentLoaded".to_string(),
+                               EventBubbles::DoesNotBubble,
+                               EventCancelable::NotCancelable).root();
         let doctarget: JSRef<EventTarget> = EventTargetCast::from_ref(*document);
         let _ = doctarget.DispatchEvent(*event);
 
@@ -858,11 +850,13 @@ impl ScriptTask {
         // the initial load.
 
         // https://html.spec.whatwg.org/multipage/#the-end step 7
-        document.set_ready_state(DocumentReadyStateValues::Complete);
+        document.set_ready_state(DocumentReadyState::Complete);
 
-        let event = Event::new(global::Window(*window), "load".to_string(), DoesNotBubble, NotCancelable).root();
+        let event = Event::new(GlobalRef::Window(*window), "load".to_string(),
+                               EventBubbles::DoesNotBubble,
+                               EventCancelable::NotCancelable).root();
         let wintarget: JSRef<EventTarget> = EventTargetCast::from_ref(*window);
-        let _ = wintarget.dispatch_event_with_target(Some(doctarget), *event);
+        let _ = wintarget.dispatch_event_with_target(doctarget, *event);
 
         *page.fragment_name.borrow_mut() = final_url.fragment.clone();
 
@@ -895,22 +889,13 @@ impl ScriptTask {
         self.compositor.borrow_mut().scroll_fragment_point(pipeline_id, LayerId::null(), point);
     }
 
+    /// Reflows non-incrementally.
     fn force_reflow(&self, page: &Page) {
-        {
-            let mut pending = page.pending_dirty_nodes.borrow_mut();
-            let js_runtime = self.js_runtime.deref().ptr;
-
-            for untrusted_node in pending.into_iter() {
-                let node = node::from_untrusted_node_address(js_runtime, untrusted_node).root();
-                node.dirty();
-            }
-        }
-
-        page.damage();
-        page.reflow(ReflowForDisplay,
+        page.dirty_all_nodes();
+        page.reflow(ReflowGoal::ForDisplay,
                     self.control_chan.clone(),
                     &mut **self.compositor.borrow_mut(),
-                    NoQuery);
+                    ReflowQueryType::NoQuery);
     }
 
     /// This is the main entry point for receiving and dispatching DOM events.
@@ -922,9 +907,27 @@ impl ScriptTask {
               self.handle_resize_event(pipeline_id, new_size);
             }
 
-            // FIXME(pcwalton): This reflows the entire document and is not incremental-y.
-            ReflowEvent(to_dirty) => {
-              self.handle_reflow_event(pipeline_id, to_dirty);
+            ReflowEvent(nodes) => {
+                // FIXME(pcwalton): This event seems to only be used by the image cache task, and
+                // the interaction between it and the image holder is really racy. I think that, in
+                // order to fix this race, we need to rewrite the image cache task to make the
+                // image holder responsible for the lifecycle of image loading instead of having
+                // the image holder and layout task both be observers. Then we can have the DOM
+                // image element observe the state of the image holder and have it send reflows
+                // via the normal dirtying mechanism, and ultimately remove this event.
+                //
+                // See the implementation of `Width()` and `Height()` in `HTMLImageElement` for
+                // fallout of this problem.
+                for node in nodes.iter() {
+                    let node_to_dirty = node::from_untrusted_node_address(self.js_runtime.ptr,
+                                                                          *node).root();
+                    let page = get_page(&*self.page.borrow(), pipeline_id);
+                    let frame = page.frame();
+                    let document = frame.as_ref().unwrap().document.root();
+                    document.content_changed(*node_to_dirty, NodeDamage::OtherNodeDamage);
+                }
+
+                self.handle_reflow_event(pipeline_id);
             }
 
             ClickEvent(_button, point) => {
@@ -967,10 +970,10 @@ impl ScriptTask {
         let meta = modifiers.contains(SUPER);
 
         let is_composing = false;
-        let is_repeating = state == Repeated;
+        let is_repeating = state == KeyState::Repeated;
         let ev_type = match state {
-            Pressed | Repeated => "keydown",
-            Released => "keyup",
+            KeyState::Pressed | KeyState::Repeated => "keydown",
+            KeyState::Released => "keyup",
         }.to_string();
 
         let props = KeyboardEvent::key_properties(key, modifiers);
@@ -985,7 +988,7 @@ impl ScriptTask {
         let mut prevented = event.DefaultPrevented();
 
         // https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#keys-cancelable-keys
-        if state != Released && props.is_printable() && !prevented {
+        if state != KeyState::Released && props.is_printable() && !prevented {
             // https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#keypress-event-order
             let event = KeyboardEvent::new(*window, "keypress".to_string(), true, true, Some(*window),
                                            0, props.key.to_string(), props.code.to_string(),
@@ -1009,18 +1012,18 @@ impl ScriptTask {
         // I'm dispatching it after the key event so the script has a chance to cancel it
         // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27337
         match key {
-            Key::KeySpace if !prevented && state == Released => {
+            Key::Space if !prevented && state == KeyState::Released => {
                 let maybe_elem: Option<JSRef<Element>> = ElementCast::to_ref(target);
                 maybe_elem.map(|el| el.as_maybe_activatable().map(|a| a.synthetic_click_activation(ctrl, alt, shift, meta)));
             }
-            Key::KeyEnter if !prevented && state == Released => {
+            Key::Enter if !prevented && state == KeyState::Released => {
                 let maybe_elem: Option<JSRef<Element>> = ElementCast::to_ref(target);
                 maybe_elem.map(|el| el.as_maybe_activatable().map(|a| a.implicit_submission(ctrl, alt, shift, meta)));
             }
             _ => ()
         }
 
-        window.flush_layout();
+        window.flush_layout(ReflowGoal::ForDisplay, ReflowQueryType::NoQuery);
     }
 
     /// The entry point for content to notify that a new load has been requested
@@ -1078,24 +1081,18 @@ impl ScriptTask {
                 let event: JSRef<Event> = EventCast::from_ref(*uievent);
 
                 let wintarget: JSRef<EventTarget> = EventTargetCast::from_ref(*window);
-                let _ = wintarget.dispatch_event_with_target(None, event);
+                wintarget.dispatch_event(event);
             }
             None => ()
         }
     }
 
-    fn handle_reflow_event(&self, pipeline_id: PipelineId, to_dirty: SmallVec1<UntrustedNodeAddress>) {
+    fn handle_reflow_event(&self, pipeline_id: PipelineId) {
         debug!("script got reflow event");
-        assert_eq!(to_dirty.len(), 0);
         let page = get_page(&*self.page.borrow(), pipeline_id);
         let frame = page.frame();
         if frame.is_some() {
-            let in_layout = page.layout_join_port.borrow().is_some();
-            if in_layout {
-                page.pending_reflows.set(page.pending_reflows.get() + 1);
-            } else {
-                self.force_reflow(&*page);
-            }
+            self.force_reflow(&*page);
         }
     }
 
@@ -1128,9 +1125,10 @@ impl ScriptTask {
                                 doc.begin_focus_transaction();
 
                                 let event =
-                                    Event::new(global::Window(*window),
+                                    Event::new(GlobalRef::Window(*window),
                                                "click".to_string(),
-                                               Bubbles, Cancelable).root();
+                                               EventBubbles::Bubbles,
+                                               EventCancelable::Cancelable).root();
                                 // https://dvcs.w3.org/hg/dom3events/raw-file/tip/html/DOM3-Events.html#trusted-events
                                 event.set_trusted(true);
                                 // https://html.spec.whatwg.org/multipage/interaction.html#run-authentic-click-activation-steps
@@ -1138,7 +1136,7 @@ impl ScriptTask {
                                 el.authentic_click_activation(*event);
 
                                 doc.commit_focus_transaction();
-                                window.flush_layout();
+                                window.flush_layout(ReflowGoal::ForDisplay, ReflowQueryType::NoQuery);
                             }
                             None => {}
                         }
@@ -1156,7 +1154,6 @@ impl ScriptTask {
         let page = get_page(&*self.page.borrow(), pipeline_id);
         match page.get_nodes_under_mouse(&point) {
             Some(node_address) => {
-
                 let mut target_list = vec!();
                 let mut target_compare = false;
 
@@ -1172,23 +1169,19 @@ impl ScriptTask {
                 }
 
                 for node_address in node_address.iter() {
-
                     let temp_node =
-                        node::from_untrusted_node_address(
-                            self.js_runtime.ptr, *node_address);
+                        node::from_untrusted_node_address(self.js_runtime.ptr, *node_address);
 
                     let maybe_node = temp_node.root().ancestors().find(|node| node.is_element());
                     match maybe_node {
                         Some(node) => {
                             node.set_hover_state(true);
-
                             match *mouse_over_targets {
-                                Some(ref mouse_over_targets) => {
-                                    if !target_compare {
-                                        target_compare = !mouse_over_targets.contains(&JS::from_rooted(node));
-                                    }
+                                Some(ref mouse_over_targets) if !target_compare => {
+                                    target_compare =
+                                        !mouse_over_targets.contains(&JS::from_rooted(node));
                                 }
-                                None => {}
+                                _ => {}
                             }
                             target_list.push(JS::from_rooted(node));
                         }
@@ -1198,15 +1191,15 @@ impl ScriptTask {
                 match *mouse_over_targets {
                     Some(ref mouse_over_targets) => {
                         if mouse_over_targets.len() != target_list.len() {
-                            target_compare = true;
+                            target_compare = true
                         }
                     }
-                    None => { target_compare = true; }
+                    None => target_compare = true,
                 }
 
                 if target_compare {
                     if mouse_over_targets.is_some() {
-                        self.force_reflow(&*page);
+                        self.force_reflow(&*page)
                     }
                     *mouse_over_targets = Some(target_list);
                 }
@@ -1220,13 +1213,11 @@ impl ScriptTask {
 /// Shuts down layout for the given page tree.
 fn shut_down_layout(page_tree: &Rc<Page>, rt: *mut JSRuntime) {
     for page in page_tree.iter() {
-        page.join_layout();
-
         // Tell the layout task to begin shutting down, and wait until it
         // processed this message.
         let (response_chan, response_port) = channel();
         let LayoutChan(ref chan) = page.layout_chan;
-        chan.send(layout_interface::PrepareToExitMsg(response_chan));
+        chan.send(layout_interface::Msg::PrepareToExit(response_chan));
         response_port.recv();
     }
 
@@ -1249,7 +1240,7 @@ fn shut_down_layout(page_tree: &Rc<Page>, rt: *mut JSRuntime) {
     // Destroy the layout task. If there were node leaks, layout will now crash safely.
     for page in page_tree.iter() {
         let LayoutChan(ref chan) = page.layout_chan;
-        chan.send(layout_interface::ExitNowMsg);
+        chan.send(layout_interface::Msg::ExitNow);
     }
 }
 
@@ -1288,7 +1279,7 @@ impl HeaderFormat for LastModified {
     // for document.lastModified.
     fn fmt_header(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let LastModified(ref tm) = *self;
-        match tm.tm_gmtoff {
+        match tm.tm_utcoff {
             0 => tm.rfc822().fmt(f),
             _ => tm.to_utc().rfc822().fmt(f)
         }
@@ -1296,5 +1287,5 @@ impl HeaderFormat for LastModified {
 }
 
 fn dom_last_modified(tm: &Tm) -> String {
-    tm.to_local().strftime("%m/%d/%Y %H:%M:%S").unwrap()
+    format!("{}", tm.to_local().strftime("%m/%d/%Y %H:%M:%S").unwrap())
 }

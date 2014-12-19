@@ -12,12 +12,12 @@ use dom::bindings::js::{MutNullableJS, JSRef, Temporary, OptionalRootable};
 use dom::bindings::utils::{Reflectable, Reflector};
 use dom::document::Document;
 use dom::domtokenlist::DOMTokenList;
-use dom::element::{AttributeHandlers, Element, HTMLLinkElementTypeId};
-use dom::eventtarget::{EventTarget, NodeTargetTypeId};
+use dom::element::{AttributeHandlers, Element, ElementTypeId};
+use dom::eventtarget::{EventTarget, EventTargetTypeId};
 use dom::htmlelement::HTMLElement;
-use dom::node::{Node, NodeHelpers, ElementNodeTypeId, window_from_node};
+use dom::node::{Node, NodeHelpers, NodeTypeId, window_from_node};
 use dom::virtualmethods::VirtualMethods;
-use layout_interface::{LayoutChan, LoadStylesheetMsg};
+use layout_interface::{LayoutChan, Msg};
 use servo_util::str::{DOMString, HTML_SPACE_CHARACTERS};
 
 use std::ascii::AsciiExt;
@@ -33,14 +33,14 @@ pub struct HTMLLinkElement {
 
 impl HTMLLinkElementDerived for EventTarget {
     fn is_htmllinkelement(&self) -> bool {
-        *self.type_id() == NodeTargetTypeId(ElementNodeTypeId(HTMLLinkElementTypeId))
+        *self.type_id() == EventTargetTypeId::Node(NodeTypeId::Element(ElementTypeId::HTMLLinkElement))
     }
 }
 
 impl HTMLLinkElement {
     fn new_inherited(localName: DOMString, prefix: Option<DOMString>, document: JSRef<Document>) -> HTMLLinkElement {
         HTMLLinkElement {
-            htmlelement: HTMLElement::new_inherited(HTMLLinkElementTypeId, localName, prefix, document),
+            htmlelement: HTMLElement::new_inherited(ElementTypeId::HTMLLinkElement, localName, prefix, document),
             rel_list: Default::default(),
         }
     }
@@ -131,7 +131,7 @@ impl<'a> PrivateHTMLLinkElementHelpers for JSRef<'a, HTMLLinkElement> {
         match UrlParser::new().base_url(&window.page().get_url()).parse(href) {
             Ok(url) => {
                 let LayoutChan(ref layout_chan) = window.page().layout_chan;
-                layout_chan.send(LoadStylesheetMsg(url));
+                layout_chan.send(Msg::LoadStylesheet(url));
             }
             Err(e) => debug!("Parsing url {:s} failed: {}", href, e)
         }

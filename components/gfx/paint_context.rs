@@ -5,13 +5,16 @@
 //! Painting of display lists using Moz2D/Azure.
 
 use azure::azure::AzIntSize;
-use azure::azure_hl::{B8G8R8A8, A8, Color, ColorPattern, ColorPatternRef, DrawOptions};
-use azure::azure_hl::{DrawSurfaceOptions, DrawTarget, ExtendClamp, GradientStop, Linear};
-use azure::azure_hl::{LinearGradientPattern, LinearGradientPatternRef, SourceOp, StrokeOptions};
+use azure::azure_hl::{A8, B8G8R8A8, Color, ColorPattern, ColorPatternRef, DrawOptions};
+use azure::azure_hl::{DrawSurfaceOptions, DrawTarget, ExtendClamp, GaussianBlurFilterType};
+use azure::azure_hl::{GaussianBlurInput, GradientStop, Linear, LinearGradientPattern};
+use azure::azure_hl::{LinearGradientPatternRef, Path, SourceOp, StdDeviationGaussianBlurAttribute};
+use azure::azure_hl::{StrokeOptions};
 use azure::scaled_font::ScaledFont;
 use azure::{AZ_CAP_BUTT, AzFloat, struct__AzDrawOptions, struct__AzGlyph};
 use azure::{struct__AzGlyphBuffer, struct__AzPoint, AzDrawTargetFillGlyphs};
-use display_list::{SidewaysLeft, SidewaysRight, TextDisplayItem, Upright, BorderRadii};
+use display_list::{BOX_SHADOW_INFLATION_FACTOR, TextDisplayItem, BorderRadii};
+use display_list::TextOrientation::{SidewaysLeft, SidewaysRight, Upright};
 use font_context::FontContext;
 use geom::matrix2d::Matrix2D;
 use geom::point::Point2D;
@@ -22,11 +25,11 @@ use libc::size_t;
 use libc::types::common::c99::{uint16_t, uint32_t};
 use png::{RGB8, RGBA8, K8, KA8};
 use servo_net::image::base::Image;
-use servo_util::geometry::Au;
+use servo_util::geometry::{Au, MAX_RECT};
 use servo_util::opts;
 use servo_util::range::Range;
 use std::default::Default;
-use std::num::{Float, FloatMath, Zero};
+use std::num::{Float, FloatMath};
 use std::ptr;
 use style::computed_values::border_style;
 use sync::Arc;
@@ -40,6 +43,8 @@ pub struct PaintContext<'a> {
     pub page_rect: Rect<f32>,
     /// The rectangle that this context encompasses in screen coordinates (pixels).
     pub screen_rect: Rect<uint>,
+    /// The clipping rect for the stacking context as a whole.
+    pub clip_rect: Option<Rect<Au>>,
     /// The current transient clipping rect, if any. A "transient clipping rect" is the clipping
     /// rect used by the last display item. We cache the last value so that we avoid pushing and
     /// popping clip rects unnecessarily.
@@ -58,7 +63,7 @@ enum DashSize {
     DashedBorder = 3
 }
 
-impl<'a> PaintContext<'a>  {
+impl<'a> PaintContext<'a> {
     pub fn get_draw_target(&self) -> &DrawTarget {
         &self.draw_target
     }
@@ -81,10 +86,10 @@ impl<'a> PaintContext<'a>  {
 
         self.draw_target.make_current();
 
-        self.draw_border_segment(Top, bounds, border, &radius, color, style);
-        self.draw_border_segment(Right, bounds, border, &radius, color, style);
-        self.draw_border_segment(Bottom, bounds, border, &radius, color, style);
-        self.draw_border_segment(Left, bounds, border, &radius, color, style);
+        self.draw_border_segment(Direction::Top, bounds, border, &radius, color, style);
+        self.draw_border_segment(Direction::Right, bounds, border, &radius, color, style);
+        self.draw_border_segment(Direction::Bottom, bounds, border, &radius, color, style);
+        self.draw_border_segment(Direction::Left, bounds, border, &radius, color, style);
     }
 
     pub fn draw_line(&self,
@@ -166,10 +171,10 @@ impl<'a> PaintContext<'a>  {
                            color: SideOffsets2D<Color>,
                            style: SideOffsets2D<border_style::T>) {
         let (style_select, color_select) = match direction {
-            Top => (style.top, color.top),
-            Left => (style.left, color.left),
-            Right => (style.right, color.right),
-            Bottom => (style.bottom, color.bottom)
+            Direction::Top => (style.top, color.top),
+            Direction::Left => (style.left, color.left),
+            Direction::Right => (style.right, color.right),
+            Direction::Bottom => (style.bottom, color.bottom)
         };
 
         match style_select{
@@ -179,10 +184,10 @@ impl<'a> PaintContext<'a>  {
             }
             //FIXME(sammykim): This doesn't work with dash_pattern and cap_style well. I referred firefox code.
             border_style::dotted                       => {
-                self.draw_dashed_border_segment(direction, bounds, border, color_select, DottedBorder);
+                self.draw_dashed_border_segment(direction, bounds, border, color_select, DashSize::DottedBorder);
             }
             border_style::dashed                       => {
-                self.draw_dashed_border_segment(direction, bounds, border, color_select, DashedBorder);
+                self.draw_dashed_border_segment(direction, bounds, border, color_select, DashSize::DashedBorder);
             }
             border_style::solid                        => {
                 self.draw_solid_border_segment(direction,bounds,border,radius,color_select);
@@ -205,22 +210,22 @@ impl<'a> PaintContext<'a>  {
         match style {
             border_style::none | border_style::hidden  => {}
             border_style::dotted                       => {
-                self.draw_dashed_border_segment(Right, bounds, border, color, DottedBorder);
+                self.draw_dashed_border_segment(Direction::Right, bounds, border, color, DashSize::DottedBorder);
             }
             border_style::dashed                       => {
-                self.draw_dashed_border_segment(Right, bounds, border, color, DashedBorder);
+                self.draw_dashed_border_segment(Direction::Right, bounds, border, color, DashSize::DashedBorder);
             }
             border_style::solid                        => {
-                self.draw_solid_border_segment(Right, bounds, border, radius, color);
+                self.draw_solid_border_segment(Direction::Right, bounds, border, radius, color);
             }
             border_style::double                       => {
-                self.draw_double_border_segment(Right, bounds, border, radius, color);
+                self.draw_double_border_segment(Direction::Right, bounds, border, radius, color);
             }
             border_style::groove | border_style::ridge => {
-                self.draw_groove_ridge_border_segment(Right, bounds, border, radius, color, style);
+                self.draw_groove_ridge_border_segment(Direction::Right, bounds, border, radius, color, style);
             }
             border_style::inset | border_style::outset => {
-                self.draw_inset_outset_border_segment(Right, bounds, border, radius, color, style);
+                self.draw_inset_outset_border_segment(Direction::Right, bounds, border, radius, color, style);
             }
         }
     }
@@ -349,7 +354,7 @@ impl<'a> PaintContext<'a>  {
         }
 
         match direction {
-            Top    => {
+            Direction::Top    => {
                 let edge_TL = box_TL  + dx(radius.top_left.max(border.left));
                 let edge_TR = box_TR  + dx(-radius.top_right.max(border.right));
                 let edge_BR = edge_TR + dy(border.top);
@@ -382,7 +387,7 @@ impl<'a> PaintContext<'a>  {
                     path_builder.arc(origin, radius.top_left,   rad_TL, rad_T, false);
                 }
             }
-            Left   => {
+            Direction::Left   => {
                 let edge_TL = box_TL  + dy(radius.top_left.max(border.top));
                 let edge_BL = box_BL  + dy(-radius.bottom_left.max(border.bottom));
                 let edge_TR = edge_TL + dx(border.left);
@@ -413,7 +418,7 @@ impl<'a> PaintContext<'a>  {
                     path_builder.arc(origin, radius.bottom_left, rad_BL, rad_L, false);
                 }
             }
-            Right  => {
+            Direction::Right  => {
                 let edge_TR = box_TR  + dy(radius.top_right.max(border.top));
                 let edge_BR = box_BR  + dy(-radius.bottom_right.max(border.bottom));
                 let edge_TL = edge_TR + dx(-border.right);
@@ -444,7 +449,7 @@ impl<'a> PaintContext<'a>  {
                     path_builder.arc(origin, distance_to_elbow,   rad_BR, rad_R, true);
                 }
             }
-            Bottom => {
+            Direction::Bottom => {
                 let edge_BL = box_BL  + dx(radius.bottom_left.max(border.left));
                 let edge_BR = box_BR  + dx(-radius.bottom_right.max(border.right));
                 let edge_TL = edge_BL + dy(-border.bottom);
@@ -495,10 +500,10 @@ impl<'a> PaintContext<'a>  {
         stroke_opts.set_cap_style(AZ_CAP_BUTT as u8);
 
         let border_width = match direction {
-            Top => border.top,
-            Left => border.left,
-            Right => border.right,
-            Bottom => border.bottom
+            Direction::Top => border.top,
+            Direction::Left => border.left,
+            Direction::Right => border.right,
+            Direction::Bottom => border.bottom
         };
 
         stroke_opts.line_width = border_width;
@@ -508,25 +513,25 @@ impl<'a> PaintContext<'a>  {
         stroke_opts.mDashLength = dash.len() as size_t;
 
         let (start, end)  = match direction {
-            Top => {
+            Direction::Top => {
                 let y = rect.origin.y + border.top * 0.5;
                 let start = Point2D(rect.origin.x, y);
                 let end = Point2D(rect.origin.x + rect.size.width, y);
                 (start, end)
             }
-            Left => {
+            Direction::Left => {
                 let x = rect.origin.x + border.left * 0.5;
                 let start = Point2D(x, rect.origin.y + rect.size.height);
                 let end = Point2D(x, rect.origin.y + border.top);
                 (start, end)
             }
-            Right => {
+            Direction::Right => {
                 let x = rect.origin.x + rect.size.width - border.right * 0.5;
                 let start = Point2D(x, rect.origin.y);
                 let end = Point2D(x, rect.origin.y + rect.size.height);
                 (start, end)
             }
-            Bottom => {
+            Direction::Bottom => {
                 let y = rect.origin.y + rect.size.height - border.bottom * 0.5;
                 let start = Point2D(rect.origin.x + rect.size.width, y);
                 let end = Point2D(rect.origin.x + border.left, y);
@@ -612,8 +617,10 @@ impl<'a> PaintContext<'a>  {
         }
 
         let (outer_color, inner_color) = match (direction, is_groove) {
-            (Top, true)  | (Left, true)  | (Right, false) | (Bottom, false) => (darker_color, lighter_color),
-            (Top, false) | (Left, false) | (Right, true)  | (Bottom, true)  => (lighter_color, darker_color)
+            (Direction::Top, true)  | (Direction::Left, true)  |
+            (Direction::Right, false) | (Direction::Bottom, false) => (darker_color, lighter_color),
+            (Direction::Top, false) | (Direction::Left, false) |
+            (Direction::Right, true)  | (Direction::Bottom, true)  => (lighter_color, darker_color)
         };
         // outer portion of the border
         self.draw_border_path(&original_bounds, direction, scaled_border, radius, outer_color);
@@ -635,12 +642,22 @@ impl<'a> PaintContext<'a>  {
         };
         // original bounds as a Rect<f32>
         let original_bounds = self.get_scaled_bounds(bounds, border, 0.0);
-        // select and scale the color appropriately.
-        let scaled_color    = match direction {
-            Top             => self.scale_color(color, if is_inset { 2.0/3.0 } else { 1.0     }),
-            Left            => self.scale_color(color, if is_inset { 1.0/6.0 } else { 0.5     }),
-            Right | Bottom  => self.scale_color(color, if is_inset { 1.0     } else { 2.0/3.0 })
-        };
+
+        let mut scaled_color;
+
+        // You can't scale black color (i.e. 'scaled = 0 * scale', equals black).
+        if color.r != 0.0 || color.g != 0.0 || color.b != 0.0 {
+            scaled_color = match direction {
+                Direction::Top | Direction::Left      => self.scale_color(color, if is_inset { 2.0/3.0 } else { 1.0     }),
+                Direction::Right | Direction::Bottom  => self.scale_color(color, if is_inset { 1.0     } else { 2.0/3.0 })
+            };
+        } else {
+            scaled_color = match direction {
+                Direction::Top | Direction::Left      => if is_inset { Color::new(0.3, 0.3, 0.3, color.a) } else { Color::new(0.7, 0.7, 0.7, color.a) },
+                Direction::Right | Direction::Bottom  => if is_inset { Color::new(0.7, 0.7, 0.7, color.a) } else { Color::new(0.3, 0.3, 0.3, color.a) }
+            };
+        }
+
         self.draw_border_path(&original_bounds, direction, border, radius, scaled_color);
     }
 
@@ -660,7 +677,7 @@ impl<'a> PaintContext<'a>  {
                 self.draw_target.set_transform(&current_transform.mul(&Matrix2D::new(0., -1.,
                                                                                      1., 0.,
                                                                                      x, y)));
-                Zero::zero()
+                Point2D::zero()
             }
             SidewaysRight => {
                 let x = text.baseline_origin.x.to_subpx() as AzFloat;
@@ -668,7 +685,7 @@ impl<'a> PaintContext<'a>  {
                 self.draw_target.set_transform(&current_transform.mul(&Matrix2D::new(0., 1.,
                                                                                      -1., 0.,
                                                                                      x, y)));
-                Zero::zero()
+                Point2D::zero()
             }
         };
 
@@ -751,6 +768,108 @@ impl<'a> PaintContext<'a>  {
                                       draw_options);
         self.draw_target.set_transform(&old_transform);
     }
+
+    /// Draws a box shadow with the given boundaries, color, offset, blur radius, and spread
+    /// radius. `box_bounds` represents the boundaries of the box.
+    pub fn draw_box_shadow(&mut self,
+                           box_bounds: &Rect<Au>,
+                           offset: &Point2D<Au>,
+                           color: Color,
+                           blur_radius: Au,
+                           spread_radius: Au,
+                           inset: bool) {
+        // Remove both the transient clip and the stacking context clip, because we may need to
+        // draw outside the stacking context's clip.
+        self.remove_transient_clip_if_applicable();
+        self.pop_clip_if_applicable();
+
+        // If we have blur, create a new draw target that's the same size as this tile, but with
+        // enough space around the edges to hold the entire blur. (If we don't do the latter, then
+        // there will be seams between tiles.)
+        //
+        // FIXME(pcwalton): This draw target might be larger than necessary and waste memory.
+        let side_inflation = (blur_radius * BOX_SHADOW_INFLATION_FACTOR).to_subpx().ceil() as i32;
+        let draw_target_transform = self.draw_target.get_transform();
+        let temporary_draw_target;
+        if blur_radius > Au(0) {
+            let draw_target_size = self.draw_target.get_size();
+            let draw_target_size = Size2D(draw_target_size.width, draw_target_size.height);
+            let inflated_draw_target_size = Size2D(draw_target_size.width + side_inflation * 2,
+                                                   draw_target_size.height + side_inflation * 2);
+            temporary_draw_target =
+                self.draw_target.create_similar_draw_target(&inflated_draw_target_size,
+                                                            self.draw_target.get_format());
+            temporary_draw_target.set_transform(
+                &Matrix2D::identity().translate(side_inflation as AzFloat,
+                                                side_inflation as AzFloat)
+                                     .mul(&draw_target_transform));
+        } else {
+            temporary_draw_target = self.draw_target.clone();
+        }
+
+        let shadow_bounds = box_bounds.translate(offset).inflate(spread_radius, spread_radius);
+        let path;
+        if inset {
+            path = temporary_draw_target.create_rectangular_border_path(&MAX_RECT, &shadow_bounds);
+            self.draw_target.push_clip(&self.draw_target.create_rectangular_path(box_bounds))
+        } else {
+            path = temporary_draw_target.create_rectangular_path(&shadow_bounds);
+            self.draw_target.push_clip(&self.draw_target
+                                            .create_rectangular_border_path(&MAX_RECT, box_bounds))
+        }
+
+        temporary_draw_target.fill(&path, &ColorPattern::new(color), &DrawOptions::new(1.0, 0));
+
+        // Blur, if we need to.
+        if blur_radius > Au(0) {
+            // Go ahead and create the blur now. Despite the name, Azure's notion of `StdDeviation`
+            // describes the blur radius, not the sigma for the Gaussian blur.
+            let blur_filter = self.draw_target.create_filter(GaussianBlurFilterType);
+            blur_filter.set_attribute(StdDeviationGaussianBlurAttribute(blur_radius.to_subpx() as
+                                                                        AzFloat));
+            blur_filter.set_input(GaussianBlurInput, &temporary_draw_target.snapshot());
+
+            // Blit the blur onto the tile. We undo the transforms here because we want to directly
+            // stack the temporary draw target onto the tile.
+            temporary_draw_target.set_transform(&Matrix2D::identity());
+            self.draw_target.set_transform(&Matrix2D::identity());
+            let temporary_draw_target_size = temporary_draw_target.get_size();
+            self.draw_target
+                .draw_filter(blur_filter,
+                             &Rect(Point2D(0.0, 0.0),
+                                   Size2D(temporary_draw_target_size.width as AzFloat,
+                                          temporary_draw_target_size.height as AzFloat)),
+                             &Point2D(-side_inflation as AzFloat, -side_inflation as AzFloat),
+                             DrawOptions::new(1.0, 0));
+            self.draw_target.set_transform(&draw_target_transform);
+        }
+
+        // Undo the draw target's clip.
+        self.draw_target.pop_clip();
+
+        // Push back the stacking context clip.
+        self.push_clip_if_applicable();
+    }
+
+    pub fn push_clip_if_applicable(&self) {
+        match self.clip_rect {
+            None => {}
+            Some(ref clip_rect) => self.draw_push_clip(clip_rect),
+        }
+    }
+
+    pub fn pop_clip_if_applicable(&self) {
+        if self.clip_rect.is_some() {
+            self.draw_pop_clip()
+        }
+    }
+
+    pub fn remove_transient_clip_if_applicable(&mut self) {
+        if self.transient_clip_rect.is_some() {
+            self.draw_pop_clip();
+            self.transient_clip_rect = None
+        }
+    }
 }
 
 pub trait ToAzurePoint {
@@ -782,6 +901,28 @@ pub trait ToAzureSize {
 impl ToAzureSize for AzIntSize {
     fn to_azure_size(&self) -> Size2D<AzFloat> {
         Size2D(self.width as AzFloat, self.height as AzFloat)
+    }
+}
+
+trait ToAzureIntSize {
+    fn to_azure_int_size(&self) -> Size2D<i32>;
+}
+
+impl ToAzureIntSize for Size2D<Au> {
+    fn to_azure_int_size(&self) -> Size2D<i32> {
+        Size2D(self.width.to_nearest_px() as i32, self.height.to_nearest_px() as i32)
+    }
+}
+
+impl ToAzureIntSize for Size2D<AzFloat> {
+    fn to_azure_int_size(&self) -> Size2D<i32> {
+        Size2D(self.width as i32, self.height as i32)
+    }
+}
+
+impl ToAzureIntSize for Size2D<i32> {
+    fn to_azure_int_size(&self) -> Size2D<i32> {
+        Size2D(self.width, self.height)
     }
 }
 
@@ -858,7 +999,7 @@ impl ScaledFontExtensionMethods for ScaledFont {
         for slice in run.natural_word_slices_in_range(range) {
             for (_i, glyph) in slice.glyphs.iter_glyphs_for_char_range(&slice.range) {
                 let glyph_advance = glyph.advance();
-                let glyph_offset = glyph.offset().unwrap_or(Zero::zero());
+                let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
                 let azglyph = struct__AzGlyph {
                     mIndex: glyph.id() as uint32_t,
                     mPosition: struct__AzPoint {
@@ -890,3 +1031,65 @@ impl ScaledFontExtensionMethods for ScaledFont {
         }
     }
 }
+
+trait DrawTargetExtensions {
+    /// Creates and returns a path that represents a rectangular border. Like this:
+    ///
+    /// ```text
+    ///     +--------------------------------+
+    ///     |################################|
+    ///     |#######+---------------------+##|
+    ///     |#######|                     |##|
+    ///     |#######+---------------------+##|
+    ///     |################################|
+    ///     +--------------------------------+
+    /// ```
+    fn create_rectangular_border_path<T>(&self, outer_rect: &T, inner_rect: &T)
+                                         -> Path
+                                         where T: ToAzureRect;
+
+    /// Creates and returns a path that represents a rectangle.
+    fn create_rectangular_path(&self, rect: &Rect<Au>) -> Path;
+}
+
+impl DrawTargetExtensions for DrawTarget {
+    fn create_rectangular_border_path<T>(&self, outer_rect: &T, inner_rect: &T)
+                                         -> Path
+                                         where T: ToAzureRect {
+        // +-----------+
+        // |2          |1
+        // |           |
+        // |   +---+---+
+        // |   |9  |6  |5, 10
+        // |   |   |   |
+        // |   +---+   |
+        // |    8   7  |
+        // |           |
+        // +-----------+
+        //  3           4
+
+        let (outer_rect, inner_rect) = (outer_rect.to_azure_rect(), inner_rect.to_azure_rect());
+        let path_builder = self.create_path_builder();
+        path_builder.move_to(Point2D(outer_rect.max_x(), outer_rect.origin.y));     // 1
+        path_builder.line_to(Point2D(outer_rect.origin.x, outer_rect.origin.y));    // 2
+        path_builder.line_to(Point2D(outer_rect.origin.x, outer_rect.max_y()));     // 3
+        path_builder.line_to(Point2D(outer_rect.max_x(), outer_rect.max_y()));      // 4
+        path_builder.line_to(Point2D(outer_rect.max_x(), inner_rect.origin.y));     // 5
+        path_builder.line_to(Point2D(inner_rect.max_x(), inner_rect.origin.y));     // 6
+        path_builder.line_to(Point2D(inner_rect.max_x(), inner_rect.max_y()));      // 7
+        path_builder.line_to(Point2D(inner_rect.origin.x, inner_rect.max_y()));     // 8
+        path_builder.line_to(inner_rect.origin);                                    // 9
+        path_builder.line_to(Point2D(outer_rect.max_x(), inner_rect.origin.y));     // 10
+        path_builder.finish()
+    }
+
+    fn create_rectangular_path(&self, rect: &Rect<Au>) -> Path {
+        let path_builder = self.create_path_builder();
+        path_builder.move_to(rect.origin.to_azure_point());
+        path_builder.line_to(Point2D(rect.max_x(), rect.origin.y).to_azure_point());
+        path_builder.line_to(Point2D(rect.max_x(), rect.max_y()).to_azure_point());
+        path_builder.line_to(Point2D(rect.origin.x, rect.max_y()).to_azure_point());
+        path_builder.finish()
+    }
+}
+

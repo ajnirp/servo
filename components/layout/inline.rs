@@ -6,13 +6,13 @@
 
 use css::node_style::StyledNode;
 use context::LayoutContext;
-use display_list_builder::{ContentLevel, DisplayListResult, FragmentDisplayListBuilding};
-use floats::{FloatLeft, Floats, PlacementInfo};
-use flow::{BaseFlow, FlowClass, Flow, ForceNonfloated, InlineFlowClass, MutableFlowUtils};
+use display_list_builder::{BackgroundAndBorderLevel, DisplayListBuildingResult, FragmentDisplayListBuilding};
+use floats::{FloatKind, Floats, PlacementInfo};
+use flow::{BaseFlow, FlowClass, Flow, MutableFlowUtils, ForceNonfloatedFlag};
 use flow::{IS_ABSOLUTELY_POSITIONED};
 use flow;
-use fragment::{Fragment, InlineAbsoluteHypotheticalFragment, InlineBlockFragment};
-use fragment::{FragmentBoundsIterator, ScannedTextFragment, ScannedTextFragmentInfo};
+use fragment::{Fragment, SpecificFragmentInfo};
+use fragment::{FragmentBoundsIterator, ScannedTextFragmentInfo};
 use fragment::SplitInfo;
 use incremental::{REFLOW, REFLOW_OUT_OF_FLOW};
 use layout_debug;
@@ -28,12 +28,11 @@ use gfx::text::glyph::CharIndex;
 use servo_util::geometry::Au;
 use servo_util::logical_geometry::{LogicalRect, LogicalSize, WritingMode};
 use servo_util::opts;
-use servo_util::range::{IntRangeIndex, Range, RangeIndex};
+use servo_util::range::{Range, RangeIndex};
 use servo_util::arc_ptr_eq;
 use std::cmp::max;
 use std::fmt;
 use std::mem;
-use std::num;
 use std::u16;
 use style::computed_values::{text_align, vertical_align, white_space};
 use style::ComputedValues;
@@ -169,7 +168,9 @@ bitflags! {
 struct LineBreaker {
     /// The floats we need to flow around.
     floats: Floats,
+    /// The resulting fragment list for the flow, consisting of possibly-broken fragments.
     new_fragments: Vec<Fragment>,
+    /// The next fragment or fragments that we need to work on.
     work_list: RingBuf<Fragment>,
     /// The line we're currently working on.
     pending_line: Line,
@@ -209,7 +210,7 @@ impl LineBreaker {
 
     /// Reinitializes the pending line to blank data.
     fn reset_line(&mut self) {
-        self.pending_line.range.reset(num::zero(), num::zero());
+        self.pending_line.range.reset(FragmentIndex(0), FragmentIndex(0));
         self.pending_line.bounds = LogicalRect::new(self.floats.writing_mode,
                                                     Au(0),
                                                     self.cur_b,
@@ -222,9 +223,31 @@ impl LineBreaker {
     fn scan_for_lines(&mut self, flow: &mut InlineFlow, layout_context: &LayoutContext) {
         self.reset_scanner();
 
+        // Create our fragment iterator.
         debug!("LineBreaker: scanning for lines, {} fragments", flow.fragments.len());
         let mut old_fragments = mem::replace(&mut flow.fragments, InlineFragments::new());
-        self.reflow_fragments(old_fragments.fragments.iter(), flow, layout_context);
+        let mut old_fragment_iter = old_fragments.fragments.into_iter();
+
+        // Set up our initial line state with the clean lines from a previous reflow.
+        //
+        // TODO(pcwalton): This would likely be better as a list of dirty line indices. That way we
+        // could resynchronize if we discover during reflow that all subsequent fragments must have
+        // the same position as they had in the previous reflow. I don't know how common this case
+        // really is in practice, but it's probably worth handling.
+        self.lines = mem::replace(&mut flow.lines, Vec::new());
+        match self.lines.as_slice().last() {
+            None => {}
+            Some(last_line) => {
+                for _ in range(FragmentIndex(0), last_line.range.end()) {
+                    self.new_fragments.push(old_fragment_iter.next().unwrap())
+                }
+            }
+        }
+
+        // Do the reflow.
+        self.reflow_fragments(old_fragment_iter, flow, layout_context);
+
+        // Place the fragments back into the flow.
         old_fragments.fragments = mem::replace(&mut self.new_fragments, vec![]);
         flow.fragments = old_fragments;
         flow.lines = mem::replace(&mut self.lines, Vec::new());
@@ -235,22 +258,13 @@ impl LineBreaker {
                               mut old_fragment_iter: I,
                               flow: &'a InlineFlow,
                               layout_context: &LayoutContext)
-                              where I: Iterator<&'a Fragment> {
+                              where I: Iterator<Fragment> {
         loop {
             // Acquire the next fragment to lay out from the work list or fragment list, as
             // appropriate.
-            let fragment = if self.work_list.is_empty() {
-                match old_fragment_iter.next() {
-                    None => break,
-                    Some(fragment) => {
-                        debug!("LineBreaker: working with fragment from flow: {}", fragment);
-                        (*fragment).clone()
-                    }
-                }
-            } else {
-                debug!("LineBreaker: working with fragment from work list: {}",
-                       self.work_list.front());
-                self.work_list.pop_front().unwrap()
+            let fragment = match self.next_unbroken_fragment(&mut old_fragment_iter) {
+                None => break,
+                Some(fragment) => fragment,
             };
 
             // Set up our reflow flags.
@@ -286,6 +300,65 @@ impl LineBreaker {
             debug!("LineBreaker: partially full line {} at end of scanning; committing it",
                     self.lines.len());
             self.flush_current_line()
+        }
+    }
+
+    /// Acquires a new fragment to lay out from the work list or fragment list as appropriate.
+    /// Note that you probably don't want to call this method directly in order to be
+    /// incremental-reflow-safe; try `next_unbroken_fragment` instead.
+    fn next_fragment<I>(&mut self, old_fragment_iter: &mut I) -> Option<Fragment>
+                        where I: Iterator<Fragment> {
+        if self.work_list.is_empty() {
+            return match old_fragment_iter.next() {
+                None => None,
+                Some(fragment) => {
+                    debug!("LineBreaker: working with fragment from flow: {}", fragment);
+                    Some(fragment)
+                }
+            }
+        }
+
+        debug!("LineBreaker: working with fragment from work list: {}", self.work_list.front());
+        self.work_list.pop_front()
+    }
+
+    /// Acquires a new fragment to lay out from the work list or fragment list, merging it with any
+    /// subsequent fragments as appropriate. In effect, what this method does is to return the next
+    /// fragment to lay out, undoing line break operations that any previous reflows may have
+    /// performed. You probably want to be using this method instead of `next_fragment`.
+    fn next_unbroken_fragment<I>(&mut self, old_fragment_iter: &mut I) -> Option<Fragment>
+                                 where I: Iterator<Fragment> {
+        let mut result = match self.next_fragment(old_fragment_iter) {
+            None => return None,
+            Some(fragment) => fragment,
+        };
+
+        loop {
+            // FIXME(pcwalton): Yuck! I hate this `new_line_pos` stuff. Can we avoid having to do
+            // this?
+            result.restore_new_line_pos();
+
+            let candidate = match self.next_fragment(old_fragment_iter) {
+                None => return Some(result),
+                Some(fragment) => fragment,
+            };
+
+            let need_to_merge = match (&mut result.specific, &candidate.specific) {
+                (&SpecificFragmentInfo::ScannedText(ref mut result_info),
+                 &SpecificFragmentInfo::ScannedText(ref candidate_info))
+                    if arc_ptr_eq(&result_info.run, &candidate_info.run) &&
+                        result_info.range.end() + CharIndex(1) == candidate_info.range.begin() => {
+                    // We found a previously-broken fragment. Merge it up.
+                    result_info.range.extend_by(candidate_info.range.length() + CharIndex(1));
+                    true
+                }
+                _ => false,
+            };
+
+            if !need_to_merge {
+                self.work_list.push_front(candidate);
+                return Some(result)
+            }
         }
     }
 
@@ -338,7 +411,7 @@ impl LineBreaker {
                                    first_fragment.border_box.size.block),
             ceiling: ceiling,
             max_inline_size: flow.base.position.size.inline,
-            kind: FloatLeft,
+            kind: FloatKind::Left,
         });
 
         // Simple case: if the fragment fits, then we can stop here.
@@ -558,7 +631,7 @@ impl LineBreaker {
         if self.pending_line_is_empty() {
             assert!(self.new_fragments.len() <= (u16::MAX as uint));
             self.pending_line.range.reset(FragmentIndex(self.new_fragments.len() as int),
-                                          num::zero());
+                                          FragmentIndex(0));
         }
 
         self.pending_line.range.extend_by(FragmentIndex(1));
@@ -581,7 +654,7 @@ impl LineBreaker {
 
     /// Returns true if the pending line is empty and false otherwise.
     fn pending_line_is_empty(&self) -> bool {
-        self.pending_line.range.length() == num::zero()
+        self.pending_line.range.length() == FragmentIndex(0)
     }
 }
 
@@ -637,58 +710,6 @@ impl InlineFragments {
     pub fn get_mut<'a>(&'a mut self, index: uint) -> &'a mut Fragment {
         &mut self.fragments[index]
     }
-
-    /// This function merges previously-line-broken fragments back into their
-    /// original, pre-line-breaking form.
-    pub fn merge_broken_lines(&mut self) {
-        let mut work: RingBuf<Fragment> =
-            mem::replace(&mut self.fragments, Vec::new()).into_iter().collect();
-
-        let mut out: Vec<Fragment> = Vec::new();
-
-        loop {
-            let mut left: Fragment =
-                match work.pop_front() {
-                    None       => break,
-                    Some(work) => work,
-                };
-
-            let right: Fragment =
-                match work.pop_front() {
-                    None => {
-                        out.push(left);
-                        break;
-                    }
-                    Some(work) => work,
-                };
-
-            left.restore_new_line_pos();
-
-            let right_is_from_same_fragment =
-                match (&mut left.specific, &right.specific) {
-                    (&ScannedTextFragment(ref mut left_info),
-                     &ScannedTextFragment(ref right_info)) => {
-                        if arc_ptr_eq(&left_info.run, &right_info.run)
-                        && left_info.range.end() + CharIndex(1) == right_info.range.begin() {
-                            left_info.range.extend_by(right_info.range.length() + CharIndex(1));
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                };
-
-            if right_is_from_same_fragment {
-                work.push_front(left);
-            } else {
-                out.push(left);
-                work.push_front(right);
-            }
-        }
-
-        mem::replace(&mut self.fragments, out);
-    }
 }
 
 /// Flows for inline layout.
@@ -722,7 +743,7 @@ pub struct InlineFlow {
 impl InlineFlow {
     pub fn from_fragments(fragments: InlineFragments, writing_mode: WritingMode) -> InlineFlow {
         InlineFlow {
-            base: BaseFlow::new(None, writing_mode, ForceNonfloated),
+            base: BaseFlow::new(None, writing_mode, ForceNonfloatedFlag::ForceNonfloated),
             fragments: fragments,
             lines: Vec::new(),
             minimum_block_size_above_baseline: Au(0),
@@ -924,7 +945,7 @@ impl InlineFlow {
 
 impl Flow for InlineFlow {
     fn class(&self) -> FlowClass {
-        InlineFlowClass
+        FlowClass::Inline
     }
 
     fn as_immutable_inline<'a>(&'a self) -> &'a InlineFlow {
@@ -1016,8 +1037,6 @@ impl Flow for InlineFlow {
         // Reset our state, so that we handle incremental reflow correctly.
         //
         // TODO(pcwalton): Do something smarter, like Gecko and WebKit?
-        debug!("lines: {}", self.lines);
-        self.fragments.merge_broken_lines();
         self.lines = Vec::new();
 
         // Determine how much indentation the first line wants.
@@ -1168,7 +1187,7 @@ impl Flow for InlineFlow {
     fn compute_absolute_position(&mut self) {
         for fragment in self.fragments.fragments.iter_mut() {
             let stacking_relative_position = match fragment.specific {
-                InlineBlockFragment(ref mut info) => {
+                SpecificFragmentInfo::InlineBlock(ref mut info) => {
                     let block_flow = info.flow_ref.as_block();
                     block_flow.base.absolute_position_info = self.base.absolute_position_info;
 
@@ -1180,7 +1199,7 @@ impl Flow for InlineFlow {
                                                               container_size);
                     block_flow.base.stacking_relative_position
                 }
-                InlineAbsoluteHypotheticalFragment(ref mut info) => {
+                SpecificFragmentInfo::InlineAbsoluteHypothetical(ref mut info) => {
                     let block_flow = info.flow_ref.as_block();
                     block_flow.base.absolute_position_info = self.base.absolute_position_info;
 
@@ -1196,14 +1215,14 @@ impl Flow for InlineFlow {
                 _ => continue,
             };
 
-            let clip_rect = fragment.clip_rect_for_children(self.base.clip_rect,
-                                                            stacking_relative_position);
+            let clip_rect = fragment.clip_rect_for_children(&self.base.clip_rect,
+                                                            &stacking_relative_position);
 
             match fragment.specific {
-                InlineBlockFragment(ref mut info) => {
+                SpecificFragmentInfo::InlineBlock(ref mut info) => {
                     flow::mut_base(info.flow_ref.deref_mut()).clip_rect = clip_rect
                 }
-                InlineAbsoluteHypotheticalFragment(ref mut info) => {
+                SpecificFragmentInfo::InlineAbsoluteHypothetical(ref mut info) => {
                     flow::mut_base(info.flow_ref.deref_mut()).clip_rect = clip_rect
                 }
                 _ => {}
@@ -1226,15 +1245,15 @@ impl Flow for InlineFlow {
             fragment.build_display_list(&mut *display_list,
                                         layout_context,
                                         fragment_origin,
-                                        ContentLevel,
+                                        BackgroundAndBorderLevel::Content,
                                         &self.base.clip_rect);
             match fragment.specific {
-                InlineBlockFragment(ref mut block_flow) => {
+                SpecificFragmentInfo::InlineBlock(ref mut block_flow) => {
                     let block_flow = block_flow.flow_ref.deref_mut();
                     flow::mut_base(block_flow).display_list_building_result
                                               .add_to(&mut *display_list)
                 }
-                InlineAbsoluteHypotheticalFragment(ref mut block_flow) => {
+                SpecificFragmentInfo::InlineAbsoluteHypothetical(ref mut block_flow) => {
                     let block_flow = block_flow.flow_ref.deref_mut();
                     flow::mut_base(block_flow).display_list_building_result
                                               .add_to(&mut *display_list)
@@ -1243,7 +1262,7 @@ impl Flow for InlineFlow {
             }
         }
 
-        self.base.display_list_building_result = DisplayListResult(display_list);
+        self.base.display_list_building_result = DisplayListBuildingResult::Normal(display_list);
 
         if opts::get().validate_display_list_geometry {
             self.base.validate_display_list_geometry();

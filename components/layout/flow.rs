@@ -28,12 +28,11 @@
 use css::node_style::StyledNode;
 use block::BlockFlow;
 use context::LayoutContext;
-use display_list_builder::{DisplayListBuildingResult, DisplayListResult};
-use display_list_builder::{NoDisplayListBuildingResult, StackingContextResult};
+use display_list_builder::DisplayListBuildingResult;
 use floats::Floats;
 use flow_list::{FlowList, FlowListIterator, MutFlowListIterator};
 use flow_ref::FlowRef;
-use fragment::{Fragment, FragmentBoundsIterator, TableRowFragment, TableCellFragment};
+use fragment::{Fragment, FragmentBoundsIterator, SpecificFragmentInfo};
 use incremental::{RECONSTRUCT_FLOW, REFLOW, REFLOW_OUT_OF_FLOW, RestyleDamage};
 use inline::InlineFlow;
 use model::{CollapsibleMargins, IntrinsicISizes, MarginCollapseInfo};
@@ -54,13 +53,12 @@ use servo_util::geometry::Au;
 use servo_util::logical_geometry::WritingMode;
 use servo_util::logical_geometry::{LogicalRect, LogicalSize};
 use std::mem;
-use std::num::Zero;
 use std::fmt;
 use std::iter::Zip;
 use std::raw;
 use std::sync::atomic::{AtomicUint, SeqCst};
 use std::slice::MutItems;
-use style::computed_values::{clear, float, position, text_align};
+use style::computed_values::{clear, empty_cells, float, position, text_align};
 use style::ComputedValues;
 use sync::Arc;
 
@@ -428,15 +426,16 @@ pub trait MutableOwnedFlowUtils {
 
 #[deriving(Encodable, PartialEq, Show)]
 pub enum FlowClass {
-    BlockFlowClass,
-    InlineFlowClass,
-    TableWrapperFlowClass,
-    TableFlowClass,
-    TableColGroupFlowClass,
-    TableRowGroupFlowClass,
-    TableRowFlowClass,
-    TableCaptionFlowClass,
-    TableCellFlowClass,
+    Block,
+    Inline,
+    ListItem,
+    TableWrapper,
+    Table,
+    TableColGroup,
+    TableRowGroup,
+    TableRow,
+    TableCaption,
+    TableCell,
 }
 
 /// A top-down traversal.
@@ -656,15 +655,7 @@ pub struct DescendantIter<'a> {
 
 impl<'a> Iterator<&'a mut Flow + 'a> for DescendantIter<'a> {
     fn next(&mut self) -> Option<&'a mut Flow + 'a> {
-        match self.iter.next() {
-            None => None,
-            Some(ref mut flow) => {
-                unsafe {
-                    let result: &'a mut Flow = mem::transmute(flow.deref_mut());
-                    Some(result)
-                }
-            }
-        }
+        self.iter.next().map(|flow| &mut **flow)
     }
 }
 
@@ -694,7 +685,7 @@ impl AbsolutePositionInfo {
         // of the root layer.
         AbsolutePositionInfo {
             relative_containing_block_size: LogicalSize::zero(writing_mode),
-            stacking_relative_position_of_absolute_containing_block: Zero::zero(),
+            stacking_relative_position_of_absolute_containing_block: Point2D::zero(),
             layers_needed_for_positioned_flows: false,
         }
     }
@@ -817,13 +808,13 @@ impl<E, S: Encoder<E>> Encodable<S, E> for BaseFlow {
                                 try!(e.emit_struct_field("class", 0, |e| c.class().encode(e)))
                                 e.emit_struct_field("data", 1, |e| {
                                     match c.class() {
-                                        BlockFlowClass => c.as_immutable_block().encode(e),
-                                        InlineFlowClass => c.as_immutable_inline().encode(e),
-                                        TableFlowClass => c.as_immutable_table().encode(e),
-                                        TableWrapperFlowClass => c.as_immutable_table_wrapper().encode(e),
-                                        TableRowGroupFlowClass => c.as_immutable_table_rowgroup().encode(e),
-                                        TableRowFlowClass => c.as_immutable_table_row().encode(e),
-                                        TableCellFlowClass => c.as_immutable_table_cell().encode(e),
+                                        FlowClass::Block => c.as_immutable_block().encode(e),
+                                        FlowClass::Inline => c.as_immutable_inline().encode(e),
+                                        FlowClass::Table => c.as_immutable_table().encode(e),
+                                        FlowClass::TableWrapper => c.as_immutable_table_wrapper().encode(e),
+                                        FlowClass::TableRowGroup => c.as_immutable_table_rowgroup().encode(e),
+                                        FlowClass::TableRow => c.as_immutable_table_row().encode(e),
+                                        FlowClass::TableCell => c.as_immutable_table_cell().encode(e),
                                         _ => { Ok(()) }     // TODO: Support captions
                                     }
                                 })
@@ -876,7 +867,7 @@ impl BaseFlow {
                     _ => {}
                 }
 
-                if force_nonfloated == FloatIfNecessary {
+                if force_nonfloated == ForceNonfloatedFlag::FloatIfNecessary {
                     match node_style.get_box().float {
                         float::none => {}
                         float::left => flags.insert(FLOATS_LEFT),
@@ -910,16 +901,16 @@ impl BaseFlow {
             parallel: FlowParallelInfo::new(),
             floats: Floats::new(writing_mode),
             collapsible_margins: CollapsibleMargins::new(),
-            stacking_relative_position: Zero::zero(),
+            stacking_relative_position: Point2D::zero(),
             abs_descendants: Descendants::new(),
             absolute_static_i_offset: Au(0),
             fixed_static_i_offset: Au(0),
             block_container_inline_size: Au(0),
             block_container_explicit_block_size: None,
             absolute_cb: ContainingBlockLink::new(),
-            display_list_building_result: NoDisplayListBuildingResult,
+            display_list_building_result: DisplayListBuildingResult::None,
             absolute_position_info: AbsolutePositionInfo::new(writing_mode),
-            clip_rect: Rect(Zero::zero(), Size2D(Au(0), Au(0))),
+            clip_rect: Rect(Point2D::zero(), Size2D::zero()),
             flags: flags,
             writing_mode: writing_mode,
         }
@@ -947,11 +938,11 @@ impl BaseFlow {
                                  position_with_overflow.size.block));
 
         let all_items = match self.display_list_building_result {
-            NoDisplayListBuildingResult => Vec::new(),
-            StackingContextResult(ref stacking_context) => {
+            DisplayListBuildingResult::None => Vec::new(),
+            DisplayListBuildingResult::StackingContext(ref stacking_context) => {
                 stacking_context.display_list.all_display_items()
             }
-            DisplayListResult(ref display_list) => display_list.all_display_items(),
+            DisplayListBuildingResult::Normal(ref display_list) => display_list.all_display_items(),
         };
 
         for item in all_items.iter() {
@@ -986,7 +977,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is a block flow.
     fn is_block_like(self) -> bool {
         match self.class() {
-            BlockFlowClass => true,
+            FlowClass::Block => true,
             _ => false,
         }
     }
@@ -996,8 +987,8 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// table-column-group flow, or table-caption flow.
     fn is_proper_table_child(self) -> bool {
         match self.class() {
-            TableRowFlowClass | TableRowGroupFlowClass |
-                TableColGroupFlowClass | TableCaptionFlowClass => true,
+            FlowClass::TableRow | FlowClass::TableRowGroup |
+                FlowClass::TableColGroup | FlowClass::TableCaption => true,
             _ => false,
         }
     }
@@ -1005,7 +996,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is a table row flow.
     fn is_table_row(self) -> bool {
         match self.class() {
-            TableRowFlowClass => true,
+            FlowClass::TableRow => true,
             _ => false,
         }
     }
@@ -1013,7 +1004,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is a table cell flow.
     fn is_table_cell(self) -> bool {
         match self.class() {
-            TableCellFlowClass => true,
+            FlowClass::TableCell => true,
             _ => false,
         }
     }
@@ -1021,7 +1012,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is a table colgroup flow.
     fn is_table_colgroup(self) -> bool {
         match self.class() {
-            TableColGroupFlowClass => true,
+            FlowClass::TableColGroup => true,
             _ => false,
         }
     }
@@ -1029,7 +1020,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is a table flow.
     fn is_table(self) -> bool {
         match self.class() {
-            TableFlowClass => true,
+            FlowClass::Table => true,
             _ => false,
         }
     }
@@ -1037,7 +1028,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is a table caption flow.
     fn is_table_caption(self) -> bool {
         match self.class() {
-            TableCaptionFlowClass => true,
+            FlowClass::TableCaption => true,
             _ => false,
         }
     }
@@ -1045,7 +1036,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is a table rowgroup flow.
     fn is_table_rowgroup(self) -> bool {
         match self.class() {
-            TableRowGroupFlowClass => true,
+            FlowClass::TableRowGroup => true,
             _ => false,
         }
     }
@@ -1053,9 +1044,9 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is one of table-related flows.
     fn is_table_kind(self) -> bool {
         match self.class() {
-            TableWrapperFlowClass | TableFlowClass |
-                TableColGroupFlowClass | TableRowGroupFlowClass |
-                TableRowFlowClass | TableCaptionFlowClass | TableCellFlowClass => true,
+            FlowClass::TableWrapper | FlowClass::Table |
+                FlowClass::TableColGroup | FlowClass::TableRowGroup |
+                FlowClass::TableRow | FlowClass::TableCaption | FlowClass::TableCell => true,
             _ => false,
         }
     }
@@ -1064,9 +1055,9 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Spec: http://www.w3.org/TR/CSS21/tables.html#anonymous-boxes
     fn need_anonymous_flow(self, child: &Flow) -> bool {
         match self.class() {
-            TableFlowClass => !child.is_proper_table_child(),
-            TableRowGroupFlowClass => !child.is_table_row(),
-            TableRowFlowClass => !child.is_table_cell(),
+            FlowClass::Table => !child.is_proper_table_child(),
+            FlowClass::TableRowGroup => !child.is_table_row(),
+            FlowClass::TableRow => !child.is_table_cell(),
             _ => false
         }
     }
@@ -1074,13 +1065,19 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Generates missing child flow of this flow.
     fn generate_missing_child_flow(self, node: &ThreadSafeLayoutNode) -> FlowRef {
         let flow = match self.class() {
-            TableFlowClass | TableRowGroupFlowClass => {
-                let fragment = Fragment::new_anonymous_table_fragment(node, TableRowFragment);
+            FlowClass::Table | FlowClass::TableRowGroup => {
+                let fragment =
+                    Fragment::new_anonymous_table_fragment(node,
+                                                           SpecificFragmentInfo::TableRow);
                 box TableRowFlow::from_node_and_fragment(node, fragment) as Box<Flow>
             },
-            TableRowFlowClass => {
-                let fragment = Fragment::new_anonymous_table_fragment(node, TableCellFragment);
-                box TableCellFlow::from_node_and_fragment(node, fragment) as Box<Flow>
+            FlowClass::TableRow => {
+                let fragment =
+                    Fragment::new_anonymous_table_fragment(node,
+                                                           SpecificFragmentInfo::TableCell);
+                let hide = node.style().get_inheritedtable().empty_cells == empty_cells::hide;
+                box TableCellFlow::from_node_fragment_and_visibility_flag(node, fragment, !hide) as
+                    Box<Flow>
             },
             _ => {
                 panic!("no need to generate a missing child")
@@ -1108,7 +1105,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     fn is_block_container(self) -> bool {
         match self.class() {
             // TODO: Change this when inline-blocks are supported.
-            BlockFlowClass | TableCaptionFlowClass | TableCellFlowClass => {
+            FlowClass::Block | FlowClass::TableCaption | FlowClass::TableCell => {
                 // FIXME: Actually check the type of the node
                 self.child_count() != 0
             }
@@ -1119,7 +1116,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is a block flow.
     fn is_block_flow(self) -> bool {
         match self.class() {
-            BlockFlowClass => true,
+            FlowClass::Block => true,
             _ => false,
         }
     }
@@ -1127,7 +1124,7 @@ impl<'a> ImmutableFlowUtils for &'a Flow + 'a {
     /// Returns true if this flow is an inline flow.
     fn is_inline_flow(self) -> bool {
         match self.class() {
-            InlineFlowClass => true,
+            FlowClass::Inline => true,
             _ => false,
         }
     }
@@ -1194,20 +1191,27 @@ impl<'a> MutableFlowUtils for &'a mut Flow + 'a {
         let mut overflow = my_position;
 
         if self.is_block_container() {
+            let writing_mode = base(self).writing_mode;
+            // FIXME(#2795): Get the real container size
+            let container_size = Size2D::zero();
             for kid in child_iter(self) {
                 if kid.is_store_overflow_delayed() {
                     // Absolute flows will be handled by their CB. If we are
                     // their CB, they will show up in `abs_descendants`.
                     continue;
                 }
-                let mut kid_overflow = base(kid).overflow;
+                let kid_base = base(kid);
+                let mut kid_overflow = kid_base.overflow.convert(
+                    kid_base.writing_mode, writing_mode, container_size);
                 kid_overflow = kid_overflow.translate(&my_position.start);
                 overflow = overflow.union(&kid_overflow)
             }
 
             // FIXME(#2004, pcwalton): This is wrong for `position: fixed`.
             for descendant_link in mut_base(self).abs_descendants.iter() {
-                let mut kid_overflow = base(descendant_link).overflow;
+                let kid_base = base(descendant_link);
+                let mut kid_overflow = kid_base.overflow.convert(
+                    kid_base.writing_mode, writing_mode, container_size);
                 kid_overflow = kid_overflow.translate(&my_position.start);
                 overflow = overflow.union(&kid_overflow)
             }

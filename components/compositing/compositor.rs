@@ -2,30 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use compositor_layer::{CompositorData, CompositorLayer, DoesntWantScrollEvents};
-use compositor_layer::{WantsScrollEvents};
-use compositor_task;
-use compositor_task::{ChangePageLoadData, ChangePageTitle, ChangePaintState, ChangeReadyState};
+use compositor_layer::{CompositorData, CompositorLayer, WantsScrollEventsFlag};
 use compositor_task::{CompositorEventListener, CompositorProxy, CompositorReceiver};
-use compositor_task::{CompositorTask, CreateOrUpdateDescendantLayer, CreateOrUpdateRootLayer};
-use compositor_task::{Exit, FrameTreeUpdateMsg, GetGraphicsMetadata, LayerProperties};
-use compositor_task::{LoadComplete, Msg, Paint, PaintMsgDiscarded, ScrollFragmentPoint};
-use compositor_task::{ScrollTimeout, SetIds, SetLayerOrigin, ShutdownComplete};
+use compositor_task::{CompositorTask, LayerProperties, Msg};
 use constellation::{FrameId, FrameTreeDiff, SendableFrameTree};
 use pipeline::CompositionPipeline;
 use scrolling::ScrollingTimerProxy;
 use windowing;
-use windowing::{IdleWindowEvent, InitializeCompositingWindowEvent};
-use windowing::{KeyEvent, LoadUrlWindowEvent, MouseWindowClickEvent, MouseWindowEvent};
-use windowing::{MouseWindowEventClass, MouseWindowMouseDownEvent, MouseWindowMouseUpEvent};
-use windowing::{MouseWindowMoveEventClass, NavigationWindowEvent, PinchZoomWindowEvent};
-use windowing::{QuitWindowEvent, RefreshWindowEvent, ResizeWindowEvent, ScrollWindowEvent};
-use windowing::{WindowEvent, WindowMethods, WindowNavigateMsg, ZoomWindowEvent};
+use windowing::{MouseWindowEvent, WindowEvent, WindowMethods, WindowNavigateMsg};
 
 use azure::azure_hl;
 use std::cmp;
 use std::mem;
-use std::num::Zero;
 use geom::point::{Point2D, TypedPoint2D};
 use geom::rect::{Rect, TypedRect};
 use geom::size::TypedSize2D;
@@ -54,6 +42,7 @@ use servo_util::{memory, time};
 use std::collections::HashMap;
 use std::collections::hash_map::{Occupied, Vacant};
 use std::path::Path;
+use std::num::FloatMath;
 use std::rc::Rc;
 use std::slice::bytes::copy_memory;
 use time::{precise_time_ns, precise_time_s};
@@ -186,15 +175,15 @@ impl<Window: WindowMethods> IOCompositor<Window> {
             context: None,
             root_pipeline: None,
             scene: Scene::new(Rect {
-                origin: Zero::zero(),
+                origin: Point2D::zero(),
                 size: window_size.as_f32(),
             }),
             window_size: window_size,
             hidpi_factor: hidpi_factor,
             scrolling_timer: ScrollingTimerProxy::new(sender),
-            composition_request: NoCompositingNecessary,
+            composition_request: CompositionRequest::NoCompositingNecessary,
             pending_scroll_events: Vec::new(),
-            shutdown_state: NotShuttingDown,
+            shutdown_state: ShutdownState::NotShuttingDown,
             page_zoom: ScaleFactor(1.0),
             viewport_zoom: ScaleFactor(1.0),
             zoom_action: false,
@@ -237,83 +226,88 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
     fn handle_browser_message(&mut self, msg: Msg) -> bool {
         match (msg, self.shutdown_state) {
-            (_, FinishedShuttingDown) =>
+            (_, ShutdownState::FinishedShuttingDown) =>
                 panic!("compositor shouldn't be handling messages after shutting down"),
 
-            (Exit(chan), _) => {
+            (Msg::Exit(chan), _) => {
                 debug!("shutting down the constellation");
                 let ConstellationChan(ref con_chan) = self.constellation_chan;
                 con_chan.send(ExitMsg);
                 chan.send(());
-                self.shutdown_state = ShuttingDown;
+                self.shutdown_state = ShutdownState::ShuttingDown;
             }
 
-            (ShutdownComplete, _) => {
+            (Msg::ShutdownComplete, _) => {
                 debug!("constellation completed shutdown");
-                self.shutdown_state = FinishedShuttingDown;
+                self.shutdown_state = ShutdownState::FinishedShuttingDown;
                 return false;
             }
 
-            (ChangeReadyState(pipeline_id, ready_state), NotShuttingDown) => {
+            (Msg::ChangeReadyState(pipeline_id, ready_state), ShutdownState::NotShuttingDown) => {
                 self.change_ready_state(pipeline_id, ready_state);
             }
 
-            (ChangePaintState(pipeline_id, paint_state), NotShuttingDown) => {
+            (Msg::ChangePaintState(pipeline_id, paint_state), ShutdownState::NotShuttingDown) => {
                 self.change_paint_state(pipeline_id, paint_state);
             }
 
-            (ChangePageTitle(pipeline_id, title), NotShuttingDown) => {
+            (Msg::ChangePageTitle(pipeline_id, title), ShutdownState::NotShuttingDown) => {
                 self.change_page_title(pipeline_id, title);
             }
 
-            (ChangePageLoadData(frame_id, load_data), NotShuttingDown) => {
+            (Msg::ChangePageLoadData(frame_id, load_data), ShutdownState::NotShuttingDown) => {
                 self.change_page_load_data(frame_id, load_data);
             }
 
-            (PaintMsgDiscarded, NotShuttingDown) => {
+            (Msg::PaintMsgDiscarded, ShutdownState::NotShuttingDown) => {
                 self.remove_outstanding_paint_msg();
             }
 
-            (SetIds(frame_tree, response_chan, new_constellation_chan), NotShuttingDown) => {
+            (Msg::SetIds(frame_tree, response_chan, new_constellation_chan),
+             ShutdownState::NotShuttingDown) => {
                 self.set_frame_tree(&frame_tree,
                                     response_chan,
                                     new_constellation_chan);
                 self.send_viewport_rects_for_all_layers();
             }
 
-            (FrameTreeUpdateMsg(frame_tree_diff, response_channel), NotShuttingDown) => {
+            (Msg::FrameTreeUpdate(frame_tree_diff, response_channel),
+             ShutdownState::NotShuttingDown) => {
                 self.update_frame_tree(&frame_tree_diff);
                 response_channel.send(());
             }
 
-            (CreateOrUpdateRootLayer(layer_properties), NotShuttingDown) => {
+            (Msg::CreateOrUpdateRootLayer(layer_properties), ShutdownState::NotShuttingDown) => {
                 self.create_or_update_root_layer(layer_properties);
             }
 
-            (CreateOrUpdateDescendantLayer(layer_properties), NotShuttingDown) => {
+            (Msg::CreateOrUpdateDescendantLayer(layer_properties),
+             ShutdownState::NotShuttingDown) => {
                 self.create_or_update_descendant_layer(layer_properties);
             }
 
-            (GetGraphicsMetadata(chan), NotShuttingDown) => {
+            (Msg::GetGraphicsMetadata(chan), ShutdownState::NotShuttingDown) => {
                 chan.send(Some(self.window.native_metadata()));
             }
 
-            (SetLayerOrigin(pipeline_id, layer_id, origin), NotShuttingDown) => {
+            (Msg::SetLayerOrigin(pipeline_id, layer_id, origin),
+             ShutdownState::NotShuttingDown) => {
                 self.set_layer_origin(pipeline_id, layer_id, origin);
             }
 
-            (Paint(pipeline_id, epoch, replies), NotShuttingDown) => {
+            (Msg::Paint(pipeline_id, epoch, replies), ShutdownState::NotShuttingDown) => {
                 for (layer_id, new_layer_buffer_set) in replies.into_iter() {
                     self.paint(pipeline_id, layer_id, new_layer_buffer_set, epoch);
                 }
                 self.remove_outstanding_paint_msg();
             }
 
-            (ScrollFragmentPoint(pipeline_id, layer_id, point), NotShuttingDown) => {
+            (Msg::ScrollFragmentPoint(pipeline_id, layer_id, point),
+             ShutdownState::NotShuttingDown) => {
                 self.scroll_fragment_to_point(pipeline_id, layer_id, point);
             }
 
-            (LoadComplete, NotShuttingDown) => {
+            (Msg::LoadComplete, ShutdownState::NotShuttingDown) => {
                 self.got_load_complete_message = true;
 
                 // If we're painting in headless mode, schedule a recomposite.
@@ -327,24 +321,30 @@ impl<Window: WindowMethods> IOCompositor<Window> {
                 self.window.load_end();
             }
 
-            (ScrollTimeout(timestamp), NotShuttingDown) => {
+            (Msg::ScrollTimeout(timestamp), ShutdownState::NotShuttingDown) => {
                 debug!("scroll timeout, drawing unpainted content!");
                 match self.composition_request {
-                    CompositeOnScrollTimeout(this_timestamp) if timestamp == this_timestamp => {
-                        self.composition_request = CompositeNow
+                    CompositionRequest::CompositeOnScrollTimeout(this_timestamp) => {
+                        if timestamp == this_timestamp {
+                            self.composition_request = CompositionRequest::CompositeNow
+                        }
                     }
                     _ => {}
                 }
             }
 
-            (compositor_task::KeyEvent(key, modified), NotShuttingDown) => {
+            (Msg::KeyEvent(key, modified), ShutdownState::NotShuttingDown) => {
                 self.window.handle_key(key, modified);
+            }
+
+            (Msg::SetCursor(cursor), ShutdownState::NotShuttingDown) => {
+                self.window.set_cursor(cursor)
             }
 
             // When we are shutting_down, we need to avoid performing operations
             // such as Paint that may crash because we have begun tearing down
             // the rest of our resources.
-            (_, ShuttingDown) => { }
+            (_, ShutdownState::ShuttingDown) => { }
         }
 
         true
@@ -499,13 +499,14 @@ impl<Window: WindowMethods> IOCompositor<Window> {
         let need_new_root_layer = !self.update_layer_if_exists(layer_properties);
         if need_new_root_layer {
             let root_layer = self.find_pipeline_root_layer(layer_properties.pipeline_id);
-            root_layer.update_layer_except_size(layer_properties);
+            root_layer.update_layer_except_bounds(layer_properties);
 
             let root_layer_pipeline = root_layer.extra_data.borrow().pipeline.clone();
-            let first_child = CompositorData::new_layer(root_layer_pipeline.clone(),
-                                                        layer_properties,
-                                                        DoesntWantScrollEvents,
-                                                        opts::get().tile_size);
+            let first_child = CompositorData::new_layer(
+                root_layer_pipeline.clone(),
+                layer_properties,
+                WantsScrollEventsFlag::DoesntWantScrollEvents,
+                opts::get().tile_size);
 
             // Add the first child / base layer to the front of the child list, so that
             // child iframe layers are painted on top of the base layer. These iframe
@@ -533,7 +534,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
         let root_layer_pipeline = root_layer.extra_data.borrow().pipeline.clone();
         let new_layer = CompositorData::new_layer(root_layer_pipeline,
                                                   layer_properties,
-                                                  DoesntWantScrollEvents,
+                                                  WantsScrollEventsFlag::DoesntWantScrollEvents,
                                                   root_layer.tile_size);
         root_layer.add_child(new_layer);
     }
@@ -558,7 +559,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
                       -> bool {
         match self.find_layer_with_pipeline_and_layer_id(pipeline_id, layer_id) {
             Some(ref layer) => {
-                if layer.extra_data.borrow().wants_scroll_events == WantsScrollEvents {
+                if layer.wants_scroll_events() == WantsScrollEventsFlag::WantsScrollEvents {
                     layer.clamp_scroll_offset_and_scroll_layer(TypedPoint2D(0f32, 0f32) - origin);
                 }
                 true
@@ -584,13 +585,14 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
     fn start_scrolling_timer_if_necessary(&mut self) {
         match self.composition_request {
-            CompositeNow | CompositeOnScrollTimeout(_) => return,
-            NoCompositingNecessary => {}
+            CompositionRequest::CompositeNow | CompositionRequest::CompositeOnScrollTimeout(_) =>
+                return,
+            CompositionRequest::NoCompositingNecessary => {}
         }
 
         let timestamp = precise_time_ns();
         self.scrolling_timer.scroll_event_processed(timestamp);
-        self.composition_request = CompositeOnScrollTimeout(timestamp);
+        self.composition_request = CompositionRequest::CompositeOnScrollTimeout(timestamp);
     }
 
     fn set_layer_origin(&mut self,
@@ -651,57 +653,57 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
     fn handle_window_message(&mut self, event: WindowEvent) {
         match event {
-            IdleWindowEvent => {}
+            WindowEvent::Idle => {}
 
-            RefreshWindowEvent => {
+            WindowEvent::Refresh => {
                 self.composite();
             }
 
-            InitializeCompositingWindowEvent => {
+            WindowEvent::InitializeCompositing => {
                 self.initialize_compositing();
             }
 
-            ResizeWindowEvent(size) => {
+            WindowEvent::Resize(size) => {
                 self.on_resize_window_event(size);
             }
 
-            LoadUrlWindowEvent(url_string) => {
+            WindowEvent::LoadUrl(url_string) => {
                 self.on_load_url_window_event(url_string);
             }
 
-            MouseWindowEventClass(mouse_window_event) => {
+            WindowEvent::MouseWindowEventClass(mouse_window_event) => {
                 self.on_mouse_window_event_class(mouse_window_event);
             }
 
-            MouseWindowMoveEventClass(cursor) => {
+            WindowEvent::MouseWindowMoveEventClass(cursor) => {
                 self.on_mouse_window_move_event_class(cursor);
             }
 
-            ScrollWindowEvent(delta, cursor) => {
+            WindowEvent::Scroll(delta, cursor) => {
                 self.on_scroll_window_event(delta, cursor);
             }
 
-            ZoomWindowEvent(magnification) => {
+            WindowEvent::Zoom(magnification) => {
                 self.on_zoom_window_event(magnification);
             }
 
-            PinchZoomWindowEvent(magnification) => {
+            WindowEvent::PinchZoom(magnification) => {
                 self.on_pinch_zoom_window_event(magnification);
             }
 
-            NavigationWindowEvent(direction) => {
+            WindowEvent::Navigation(direction) => {
                 self.on_navigation_window_event(direction);
             }
 
-            KeyEvent(key, state, modifiers) => {
+            WindowEvent::KeyEvent(key, state, modifiers) => {
                 self.on_key_event(key, state, modifiers);
             }
 
-            QuitWindowEvent => {
-                debug!("shutting down the constellation for QuitWindowEvent");
+            WindowEvent::Quit => {
+                debug!("shutting down the constellation for WindowEvent::Quit");
                 let ConstellationChan(ref chan) = self.constellation_chan;
                 chan.send(ExitMsg);
-                self.shutdown_state = ShuttingDown;
+                self.shutdown_state = ShutdownState::ShuttingDown;
             }
         }
     }
@@ -731,7 +733,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
         self.got_load_complete_message = false;
         let root_pipeline_id = match self.scene.root {
             Some(ref layer) => layer.extra_data.borrow().pipeline.id.clone(),
-            None => panic!("Compositor: Received LoadUrlWindowEvent without initialized compositor \
+            None => panic!("Compositor: Received WindowEvent::LoadUrl without initialized compositor \
                            layers"),
         };
 
@@ -743,9 +745,9 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
     fn on_mouse_window_event_class(&self, mouse_window_event: MouseWindowEvent) {
         let point = match mouse_window_event {
-            MouseWindowClickEvent(_, p) => p,
-            MouseWindowMouseDownEvent(_, p) => p,
-            MouseWindowMouseUpEvent(_, p) => p,
+            MouseWindowEvent::MouseWindowClickEvent(_, p) => p,
+            MouseWindowEvent::MouseWindowMouseDownEvent(_, p) => p,
+            MouseWindowEvent::MouseWindowMouseUpEvent(_, p) => p,
         };
         match self.find_topmost_layer_at_point(point / self.scene.scale) {
             Some(result) => result.layer.send_mouse_event(mouse_window_event, result.point),
@@ -853,8 +855,8 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
     fn on_navigation_window_event(&self, direction: WindowNavigateMsg) {
         let direction = match direction {
-            windowing::Forward => constellation_msg::Forward,
-            windowing::Back => constellation_msg::Back,
+            windowing::WindowNavigateMsg::Forward => constellation_msg::Forward,
+            windowing::WindowNavigateMsg::Back => constellation_msg::Back,
         };
         let ConstellationChan(ref chan) = self.constellation_chan;
         chan.send(NavigateMsg(direction))
@@ -1024,7 +1026,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
             debug!("compositor: compositing");
             // Adjust the layer dimensions as necessary to correspond to the size of the window.
             self.scene.viewport = Rect {
-                origin: Zero::zero(),
+                origin: Point2D::zero(),
                 size: self.window_size.as_f32(),
             };
             // paint the scene.
@@ -1077,7 +1079,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
             debug!("shutting down the constellation after generating an output file");
             let ConstellationChan(ref chan) = self.constellation_chan;
             chan.send(ExitMsg);
-            self.shutdown_state = ShuttingDown;
+            self.shutdown_state = ShutdownState::ShuttingDown;
         }
 
         // Perform the page flip. This will likely block for a while.
@@ -1085,13 +1087,13 @@ impl<Window: WindowMethods> IOCompositor<Window> {
 
         self.last_composite_time = precise_time_ns();
 
-        self.composition_request = NoCompositingNecessary;
+        self.composition_request = CompositionRequest::NoCompositingNecessary;
         self.process_pending_scroll_events();
     }
 
     fn composite_if_necessary(&mut self) {
-        if self.composition_request == NoCompositingNecessary {
-            self.composition_request = CompositeNow
+        if self.composition_request == CompositionRequest::NoCompositingNecessary {
+            self.composition_request = CompositionRequest::CompositeNow
         }
     }
 
@@ -1118,7 +1120,7 @@ impl<Window: WindowMethods> IOCompositor<Window> {
         };
 
         let clip_rect_for_children = if masks_to_bounds {
-            Rect(Zero::zero(), clipped_layer_bounds.size)
+            Rect(Point2D::zero(), clipped_layer_bounds.size)
         } else {
             clipped_layer_bounds.translate(&clip_rect.origin)
         };
@@ -1208,7 +1210,7 @@ fn create_root_layer_for_pipeline_and_rect(pipeline: &CompositionPipeline,
 
     let root_layer = CompositorData::new_layer(pipeline.clone(),
                                                layer_properties,
-                                               WantsScrollEvents,
+                                               WantsScrollEventsFlag::WantsScrollEvents,
                                                opts::get().tile_size);
 
     // All root layers mask to bounds.
@@ -1239,7 +1241,7 @@ impl<Window> CompositorEventListener for IOCompositor<Window> where Window: Wind
             }
         }
 
-        if self.shutdown_state == FinishedShuttingDown {
+        if self.shutdown_state == ShutdownState::FinishedShuttingDown {
             // We have exited the compositor and passing window
             // messages to script may crash.
             debug!("Exiting the compositor due to a request from script.");
@@ -1257,11 +1259,11 @@ impl<Window> CompositorEventListener for IOCompositor<Window> where Window: Wind
         }
 
         match self.composition_request {
-            NoCompositingNecessary | CompositeOnScrollTimeout(_) => {}
-            CompositeNow => self.composite(),
+            CompositionRequest::NoCompositingNecessary | CompositionRequest::CompositeOnScrollTimeout(_) => {}
+            CompositionRequest::CompositeNow => self.composite(),
         }
 
-        self.shutdown_state != FinishedShuttingDown
+        self.shutdown_state != ShutdownState::FinishedShuttingDown
     }
 
     /// Repaints and recomposites synchronously. You must be careful when calling this, as if a
@@ -1269,10 +1271,10 @@ impl<Window> CompositorEventListener for IOCompositor<Window> where Window: Wind
     ///
     /// This is used when resizing the window.
     fn repaint_synchronously(&mut self) {
-        while self.shutdown_state != ShuttingDown {
+        while self.shutdown_state != ShutdownState::ShuttingDown {
             let msg = self.port.recv_compositor_msg();
             let is_paint = match msg {
-                Paint(..) => true,
+                Msg::Paint(..) => true,
                 _ => false,
             };
             let keep_going = self.handle_browser_message(msg);
@@ -1299,10 +1301,10 @@ impl<Window> CompositorEventListener for IOCompositor<Window> where Window: Wind
 
         // Tell the profiler, memory profiler, and scrolling timer to shut down.
         let TimeProfilerChan(ref time_profiler_chan) = self.time_profiler_chan;
-        time_profiler_chan.send(time::ExitMsg);
+        time_profiler_chan.send(time::TimeProfilerMsg::Exit);
 
         let MemoryProfilerChan(ref memory_profiler_chan) = self.memory_profiler_chan;
-        memory_profiler_chan.send(memory::ExitMsg);
+        memory_profiler_chan.send(memory::MemoryProfilerMsg::Exit);
 
         self.scrolling_timer.shutdown();
     }

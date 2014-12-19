@@ -12,28 +12,32 @@ use dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use dom::bindings::codegen::InheritTypes::{ElementCast, HTMLFrameSetElementDerived};
 use dom::bindings::codegen::InheritTypes::{EventTargetCast, HTMLInputElementCast};
 use dom::bindings::codegen::InheritTypes::{HTMLElementDerived, HTMLBodyElementDerived};
-use dom::bindings::js::{JSRef, Temporary};
+use dom::bindings::js::{JSRef, Temporary, MutNullableJS};
 use dom::bindings::utils::{Reflectable, Reflector};
+use dom::cssstyledeclaration::CSSStyleDeclaration;
 use dom::document::Document;
-use dom::element::{Element, ElementTypeId, ElementTypeId_, HTMLElementTypeId, ActivationElementHelpers};
-use dom::eventtarget::{EventTarget, EventTargetHelpers, NodeTargetTypeId};
-use dom::node::{Node, ElementNodeTypeId, window_from_node};
+use dom::element::{Element, ElementTypeId, ActivationElementHelpers};
+use dom::eventtarget::{EventTarget, EventTargetHelpers, EventTargetTypeId};
+use dom::node::{Node, NodeTypeId, window_from_node};
 use dom::virtualmethods::VirtualMethods;
 
 use servo_util::str::DOMString;
 
 use string_cache::Atom;
 
+use std::default::Default;
+
 #[dom_struct]
 pub struct HTMLElement {
-    element: Element
+    element: Element,
+    style_decl: MutNullableJS<CSSStyleDeclaration>,
 }
 
 impl HTMLElementDerived for EventTarget {
     fn is_htmlelement(&self) -> bool {
         match *self.type_id() {
-            NodeTargetTypeId(ElementNodeTypeId(ElementTypeId_)) => false,
-            NodeTargetTypeId(ElementNodeTypeId(_)) => true,
+            EventTargetTypeId::Node(NodeTypeId::Element(ElementTypeId::Element)) => false,
+            EventTargetTypeId::Node(NodeTypeId::Element(_)) => true,
             _ => false
         }
     }
@@ -42,13 +46,14 @@ impl HTMLElementDerived for EventTarget {
 impl HTMLElement {
     pub fn new_inherited(type_id: ElementTypeId, tag_name: DOMString, prefix: Option<DOMString>, document: JSRef<Document>) -> HTMLElement {
         HTMLElement {
-            element: Element::new_inherited(type_id, tag_name, ns!(HTML), prefix, document)
+            element: Element::new_inherited(type_id, tag_name, ns!(HTML), prefix, document),
+            style_decl: Default::default(),
         }
     }
 
     #[allow(unrooted_must_root)]
     pub fn new(localName: DOMString, prefix: Option<DOMString>, document: JSRef<Document>) -> Temporary<HTMLElement> {
-        let element = HTMLElement::new_inherited(HTMLElementTypeId, localName, prefix, document);
+        let element = HTMLElement::new_inherited(ElementTypeId::HTMLElement, localName, prefix, document);
         Node::reflect_node(box element, document, HTMLElementBinding::Wrap)
     }
 }
@@ -65,6 +70,13 @@ impl<'a> PrivateHTMLElementHelpers for JSRef<'a, HTMLElement> {
 }
 
 impl<'a> HTMLElementMethods for JSRef<'a, HTMLElement> {
+    fn Style(self) -> Temporary<CSSStyleDeclaration> {
+        self.style_decl.or_init(|| {
+            let global = window_from_node(self).root();
+            CSSStyleDeclaration::new(*global, self)
+        })
+    }
+
     make_getter!(Title)
     make_setter!(SetTitle, "title")
 
@@ -82,7 +94,8 @@ impl<'a> HTMLElementMethods for JSRef<'a, HTMLElement> {
             let win = window_from_node(self).root();
             win.GetOnload()
         } else {
-            None
+            let target: JSRef<EventTarget> = EventTargetCast::from_ref(self);
+            target.get_event_handler_common("load")
         }
     }
 
@@ -90,6 +103,9 @@ impl<'a> HTMLElementMethods for JSRef<'a, HTMLElement> {
         if self.is_body_or_frameset() {
             let win = window_from_node(self).root();
             win.SetOnload(listener)
+        } else {
+            let target: JSRef<EventTarget> = EventTargetCast::from_ref(self);
+            target.set_event_handler_common("load", listener)
         }
     }
 

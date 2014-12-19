@@ -4,12 +4,14 @@
 
 use dom::bindings::codegen::Bindings::TestBindingBinding::TestBindingMethods;
 use dom::bindings::codegen::Bindings::TestBindingBinding::TestEnum;
-use dom::bindings::codegen::Bindings::TestBindingBinding::TestEnumValues::_empty;
+use dom::bindings::codegen::Bindings::TestBindingBinding::TestEnum::_empty;
 use dom::bindings::codegen::Bindings::EventListenerBinding::EventListener;
 use dom::bindings::codegen::Bindings::FunctionBinding::Function;
-use dom::bindings::codegen::UnionTypes::BlobOrString::BlobOrString;
-use dom::bindings::codegen::UnionTypes::EventOrString::{EventOrString, eString};
-use dom::bindings::codegen::UnionTypes::HTMLElementOrLong::{HTMLElementOrLong, eLong};
+use dom::bindings::codegen::UnionTypes::BlobOrString;
+use dom::bindings::codegen::UnionTypes::EventOrString;
+use dom::bindings::codegen::UnionTypes::EventOrString::eString;
+use dom::bindings::codegen::UnionTypes::HTMLElementOrLong;
+use dom::bindings::codegen::UnionTypes::HTMLElementOrLong::eLong;
 use dom::bindings::global::GlobalField;
 use dom::bindings::js::{JSRef, Temporary};
 use dom::bindings::str::ByteString;
@@ -17,7 +19,7 @@ use dom::bindings::utils::{Reflector, Reflectable};
 use dom::blob::Blob;
 use servo_util::str::DOMString;
 
-use js::jsapi::JSContext;
+use js::jsapi::{JSContext, JSObject};
 use js::jsval::{JSVal, NullValue};
 
 #[dom_struct]
@@ -64,6 +66,7 @@ impl<'a> TestBindingMethods for JSRef<'a, TestBinding> {
     fn SetUnionAttribute(self, _: HTMLElementOrLong) {}
     fn Union2Attribute(self) -> EventOrString { eString("".to_string()) }
     fn SetUnion2Attribute(self, _: EventOrString) {}
+    fn ArrayAttribute(self, _: *mut JSContext) -> *mut JSObject { NullValue().to_object_or_null() }
     fn AnyAttribute(self, _: *mut JSContext) -> JSVal { NullValue() }
     fn SetAnyAttribute(self, _: *mut JSContext, _: JSVal) {}
 
