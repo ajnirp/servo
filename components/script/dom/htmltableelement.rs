@@ -11,10 +11,11 @@ use dom::bindings::inheritance::Castable;
 use dom::bindings::js::{LayoutJS, Root, RootedReference};
 use dom::document::Document;
 use dom::element::{AttributeMutation, Element, RawLayoutElementHelpers};
+use dom::htmlcollection::HTMLCollection;
 use dom::htmlelement::HTMLElement;
 use dom::htmltablecaptionelement::HTMLTableCaptionElement;
 use dom::htmltablesectionelement::HTMLTableSectionElement;
-use dom::node::{Node, document_from_node};
+use dom::node::{Node, document_from_node, window_from_node};
 use dom::virtualmethods::VirtualMethods;
 use std::cell::Cell;
 use string_cache::Atom;
@@ -109,6 +110,50 @@ impl HTMLTableElementMethods for HTMLTableElement {
             .expect("Insertion failed");
         tbody
     }
+
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows
+    fn Rows(&self) -> Root<HTMLCollection> {
+        struct ElementsFilter;
+        impl CollectionFilter for ElementsFilter {
+            fn filter<'a>(&self, elem: &'a element, _root: &'a Node) -> bool {
+                [CHECK IF ELEM IS CHILD OF A THEAD WHICH IS CHILD OF SELF]
+                elem.is::<HTMLTableRowElement>() && [CHECK IF ELEM IS CHILD OF SELF];
+                [CHECK IF ELEM IS CHILD OF A TBODY WHICH IS CHILD OF SELF]
+                [CHECK IF ELEM IS CHILD OF A TFOOT WHICH IS CHILD OF SELF]
+            }
+        }
+        let tr_children =
+            node.children()
+                .filter_map(Root::downcast::<HTMLTableRowElement>)
+                .
+        )
+        let filter = box ElementsFilter;
+        let window = window_from_node(self);
+        HTMLCollection::create(window.r(),
+                               self.upcast(),
+                               filter)
+    }
+
+    // REFERENCE BEGIN
+
+    /*
+    fn Elements(&self) -> Root<HTMLCollection> {
+        #[derive(JSTraceable, HeapSizeOf)]
+        struct ElementsFilter;
+        impl CollectionFilter for ElementsFilter {
+            fn filter<'a>(&self, elem: &'a Element, _root: &'a Node) -> bool {
+                static TAG_NAMES: StaticStringVec = &["button", "fieldset", "input",
+                    "keygen", "object", "output", "select", "textarea"];
+                TAG_NAMES.iter().any(|&tag_name| tag_name == &**elem.local_name())
+            }
+        }
+        let filter = box ElementsFilter;
+        let window = window_from_node(self);
+        HTMLCollection::create(window.r(), self.upcast(), filter)
+    }
+    */
+
+    // REFERENCE END
 
     // https://html.spec.whatwg.org/multipage/#dom-table-bgcolor
     make_getter!(BgColor, "bgcolor");
